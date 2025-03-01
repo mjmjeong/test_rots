@@ -1,3 +1,6 @@
+# ProbRots: Physically Reliable Probabilistic Motion Basis for 4D Gaussian Splatting with Monocular Videos (NeurIPS 2025)
+
+
 # Shape of Motion: 4D Reconstruction from a Single Video
 **[Project Page](https://shape-of-motion.github.io/) | [Arxiv](https://arxiv.org/abs/2407.13764)**
 

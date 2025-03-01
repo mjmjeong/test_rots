@@ -579,14 +579,13 @@ def sample_initial_bases_centers(
     model.fit(vel_dirs)
     labels = model.labels_
     num_bases = labels.max().item() + 1
-    sampled_centers = torch.stack(
-        [
-            means_canonical[torch.tensor(labels == i)].median(dim=0).values
-            for i in range(num_bases)
-        ]
-    )[None]
+
+    # torch version issue
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    means_canonical = means_canonical.to(device)
+    sampled_centers = torch.stack([means_canonical[torch.tensor(labels == i).to(device)].median(dim=0).values for i in range(num_bases)])[None]
     print("number of {} clusters: ".format(mode), num_bases)
-    return sampled_centers, num_bases, torch.tensor(labels)
+    return sampled_centers.cpu(), num_bases, torch.tensor(labels).cpu()
 
 
 def interp_masked(vals: cp.ndarray, mask: cp.ndarray, pad: int = 1) -> cp.ndarray:
@@ -598,7 +597,6 @@ def interp_masked(vals: cp.ndarray, mask: cp.ndarray, pad: int = 1) -> cp.ndarra
     """
     assert mask.ndim == 2
     assert vals.shape[:2] == mask.shape
-
     B, M = mask.shape
 
     # get the first and last valid values for each track
