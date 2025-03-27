@@ -52,13 +52,100 @@ def cont_6d_to_rmat(cont_6d):
 
     return torch.stack([x, y, z], dim=-1)
 
+def quat_to_rmat(quat):
+    """
+    Converts a quaternion (w, x, y, z) to a rotation matrix (3x3) using torch.
+    The input quaternion is of shape (..., 4), where N is the number of quaternions.
+    The output is a rotation matrix of shape (..., 3, 3).
+    """
+    # Normalize the quaternions (optional)
+    quat = quat / quat.norm(dim=-1, keepdim=True)
+    *leading_dims, _ = quat.shape
+    w = quat[..., 0]
+    x = quat[..., 1]
+    y = quat[..., 2]
+    z = quat[..., 3]
+    
+    # Compute the rotation matrix from quaternion
+    rot_matrix = torch.zeros((*leading_dims, 3, 3), device=quat.device)
+    
+    rot_matrix[..., 0, 0] = 1 - 2 * (y ** 2 + z ** 2)
+    rot_matrix[..., 0, 1] = 2 * (x * y - z * w)
+    rot_matrix[..., 0, 2] = 2 * (x * z + y * w)
+    
+    rot_matrix[..., 1, 0] = 2 * (x * y + z * w)
+    rot_matrix[..., 1, 1] = 1 - 2 * (x ** 2 + z ** 2)
+    rot_matrix[..., 1, 2] = 2 * (y * z - x * w)
+    
+    rot_matrix[..., 2, 0] = 2 * (x * z - y * w)
+    rot_matrix[..., 2, 1] = 2 * (y * z + x * w)
+    rot_matrix[..., 2, 2] = 1 - 2 * (x ** 2 + y ** 2)
+    
+    return rot_matrix
+
+def quat_multiply(q1, q2):
+    """
+    Multiply two quaternions q1 and q2 (batch-wise).
+    :param q1: First quaternion (batch_size, 4)
+    :param q2: Second quaternion (batch_size, 4)
+    :returns: Resulting quaternion (batch_size, 4)
+    """
+    w1, x1, y1, z1 = q1[..., 0], q1[..., 1], q1[..., 2], q1[..., 3]
+    w2, x2, y2, z2 = q2[..., 0], q2[..., 1], q2[..., 2], q2[..., 3]
+    
+    w = w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2
+    x = w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2
+    y = w1 * y2 + y1 * w2 + z1 * x2 - x1 * z2
+    z = w1 * z2 + z1 * w2 + x1 * y2 - y1 * x2
+
+    return torch.stack((w, x, y, z), dim=-1)
+
+def quat_t_to_dq(q_r, T):
+    """
+    Converts a rotation quaternion q_r and a translation vector T to a dual quaternion.
+    :param q_r: Rotation quaternion of shape (..., 4)
+    :param T: Translation vector of shape (..., 3)
+    :returns: Dual quaternion of shape (..., 8)
+    """
+    # Normalize the rotation quaternion (optional, ensure it's unit quaternion)
+    q_r = q_r / q_r.norm(dim=-1, keepdim=True)
+
+    # Create the translation quaternion (0, T_x, T_y, T_z)
+    q_t = torch.zeros_like(q_r)
+    q_t[..., 1:] = T  # Set the translation part
+    
+    # Compute the dual quaternion: q = q_r + 1/2 * q_r * q_t
+    q_t = 0.5 * (quat_multiply(q_r, q_t))  # quaternion multiplication
+    #q_t[..., 0] = 0 #TODO: check the ablation
+    dual_quat = torch.cat((q_r, q_t), dim=-1)
+    return dual_quat
+
+
+def dq_to_quat_t(dq):
+    """
+    dq is a tensor of shape (..., 8), where each dual quaternion is represented by 8 values (w_r, x_r, y_r, z_r, w_t, x_t, y_t, z_t).
+    Returns qauternion and translation (..., 4) and (..., 3).
+    """
+    # Extract rotation quaternion (q_r) and translation quaternion (q_t)
+    q_r = dq[..., :4]  # First 4 values for rotation
+    q_t = dq[..., 4:]  # Last 4 values for translation
+
+    # Normalize the rotation quaternion (optional)
+    q_r = q_r / q_r.norm(dim=-1, keepdim=True)
+
+    # Compute translation vector T from the dual quaternion q_r and q_t
+    q_r_conjugate = torch.cat([q_r[..., 0:1], -q_r[..., 1:]], dim=-1)  # Conjugate of the rotation quaternion
+
+    # Compute the translation part using quaternion multiplication
+    T = 2 * quat_multiply(q_r_conjugate, q_t)[..., 1:]
+    return q_r, T
 
 def solve_procrustes(
     src: torch.Tensor,
     dst: torch.Tensor,
     weights: torch.Tensor | None = None,
     enforce_se3: bool = False,
-    rot_type: Literal["quat", "mat", "6d"] = "quat",
+    rot_type: Literal["quat", "mat", "6d", 'dual_quat'] = "quat",
 ):
     """
     Solve the Procrustes problem to align two point clouds, by solving the
@@ -106,7 +193,7 @@ def solve_procrustes(
         S[2, 2] = -1
     R = U @ S @ Vh
     # Compute the transformation.
-    if rot_type == "quat":
+    if rot_type in ["quat", "dual_quat"]:
         rot = roma.rotmat_to_unitquat(R).roll(1, dims=-1)
     elif rot_type == "6d":
         rot = rmat_to_cont_6d(R)

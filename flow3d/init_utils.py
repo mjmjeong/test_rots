@@ -15,6 +15,8 @@ from loguru import logger as guru
 from matplotlib.pyplot import get_cmap
 from tqdm import tqdm
 from viser import ViserServer
+import copy
+from typing import Union
 
 from flow3d.loss_utils import (
     compute_accel_loss,
@@ -25,10 +27,10 @@ from flow3d.loss_utils import (
     masked_l1_loss,
 )
 from flow3d.params import GaussianParams, MotionBases, CameraPoses
+from flow3d.custom_params import BayesianMotionBases
 from flow3d.tensor_dataclass import StaticObservations, TrackObservations
 from flow3d.transforms import cont_6d_to_rmat, rt_to_mat4, solve_procrustes
 from flow3d.vis.utils import draw_keypoints_video, get_server, project_2d_tracks
-
 
 def init_trainable_poses(w2cs: Tensor) -> CameraPoses:
     N, _, _ = w2cs.shape
@@ -115,10 +117,10 @@ def init_bg(
 def init_motion_params_with_procrustes(
     tracks_3d: TrackObservations,
     num_bases: int,
-    rot_type: Literal["quat", "6d"],
     cano_t: int,
     cluster_init_method: str = "kmeans",
     min_mean_weight: float = 0.1,
+    cfg = None, 
     vis: bool = False,
     port: int | None = None,
 ) -> tuple[MotionBases, torch.Tensor, TrackObservations]:
@@ -171,7 +173,7 @@ def init_motion_params_with_procrustes(
 
     init_rots, init_ts = [], []
 
-    if rot_type == "quat":
+    if cfg.motion.rot_type in ["quat", "dual_quat"]:
         id_rot = torch.tensor([1.0, 0.0, 0.0, 0.0], device=device)
         rot_dim = 4
     else:
@@ -197,7 +199,7 @@ def init_motion_params_with_procrustes(
         confidences = tracks_3d.confidences[mask_in_cluster].swapaxes(
             0, 1
         )  # [num_frames, n_pts]
-        weights = get_weights_for_procrustes(cluster, visibilities)
+        weights = get_weights_for_procrustes(cluster, visibilities) # frame별로 weighting
         prev_t = cano_t
         cluster_skip_ts = []
         for cur_t in tgt_ts:
@@ -218,12 +220,12 @@ def init_motion_params_with_procrustes(
                     cluster[cur_t],
                     weights=procrustes_weights,
                     enforce_se3=True,
-                    rot_type=rot_type,
+                    rot_type=cfg.motion.rot_type,
                 )
                 init_rot, init_t, _ = se3
                 assert init_rot.shape[-1] == rot_dim
                 # double cover
-                if rot_type == "quat" and torch.linalg.norm(
+                if cfg.motion.rot_type in ["quat", "dual_quat"] and torch.linalg.norm(
                     init_rot - init_rots[n][prev_t]
                 ) > torch.linalg.norm(-init_rot - init_rots[n][prev_t]):
                     init_rot = -init_rot
@@ -239,6 +241,16 @@ def init_motion_params_with_procrustes(
                 errs_before[n, cur_t] = err_before
             prev_t = cur_t
         skipped_ts[cluster_id.item()] = cluster_skip_ts
+
+    if "align_quat" in cfg.motion.init_rot_option and cfg.motion.rot_type in ['quat', 'dual_quat']:
+        _, sort_indice = motion_coefs.mean(0).sort(descending=True)
+        max_idx = sort_indice[0]
+        max_rots = init_rots[max_idx]
+        for i in sort_indice[1:]:
+            tar_rots = init_rots[i]
+            flag = (max_rots * tar_rots).sum(dim=1).mean()
+            if flag < 0:
+                init_rots[i] = -1 * init_rots[i]
 
     guru.info(f"{skipped_ts=}")
     guru.info(
@@ -264,13 +276,16 @@ def init_motion_params_with_procrustes(
 
         ipdb.set_trace()
 
-    bases = MotionBases(init_rots, init_ts)
+    if cfg.motion.basis_type == 'bayesian':
+        bases = BayesianMotionBases(init_rots, init_ts, cfg=cfg)
+    elif cfg.motion.basis_type == 'default':
+        bases = MotionBases(init_rots, init_ts, cfg=cfg)
     return bases, motion_coefs, tracks_3d
 
 
 def run_initial_optim(
     fg: GaussianParams,
-    bases: MotionBases,
+    bases: Union[MotionBases, BayesianMotionBases],
     tracks_3d: TrackObservations,
     Ks: torch.Tensor,
     w2cs: torch.Tensor,
@@ -317,13 +332,13 @@ def run_initial_optim(
     pbar = tqdm(range(0, num_iters))
     for i in pbar:
         coefs = fg.get_coefs()
-        transfms = bases.compute_transforms(ts, coefs)
+        # TODO: optimizate code book or not
+        transfms, _ = bases.compute_transforms(ts, coefs)
         positions = torch.einsum(
             "pnij,pj->pni",
             transfms,
             F.pad(fg.params["means"], (0, 1), value=1.0),
         )
-
         loss = 0.0
         track_3d_loss = masked_l1_loss(
             positions,
@@ -377,7 +392,7 @@ def run_initial_optim(
         small_acc_loss_tracks = compute_accel_loss(positions)
         loss += small_acc_loss_tracks * w_smooth * 0.5
 
-        transfms_nbs = bases.compute_transforms(ts_neighbors, coefs)
+        transfms_nbs, _ = bases.compute_transforms(ts_neighbors, coefs)
         means_nbs = torch.einsum(
             "pnij,pj->pni", transfms_nbs, F.pad(fg.params["means"], (0, 1), value=1.0)
         )  # (G, 3n, 3)
@@ -398,7 +413,6 @@ def run_initial_optim(
             f"{small_acc_loss_tracks.item():.3f} "
             f"{z_accel_loss.item():.3f} "
         )
-
 
 def random_quats(N: int) -> torch.Tensor:
     u = torch.rand(N, 1)

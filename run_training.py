@@ -4,6 +4,7 @@ import shutil
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from typing import Annotated
+from typing import Literal
 
 import numpy as np
 import torch
@@ -13,7 +14,7 @@ from loguru import logger as guru
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from flow3d.configs import LossesConfig, OptimizerConfig, SceneLRConfig
+from flow3d.configs import LossesConfig, OptimizerConfig, SceneLRConfig, MotionConfig
 from flow3d.data import (
     BaseDataset,
     DavisDataConfig,
@@ -66,6 +67,7 @@ class TrainConfig:
     lr: SceneLRConfig
     loss: LossesConfig
     optim: OptimizerConfig
+    motion: MotionConfig
     num_fg: int = 40_000
     num_bg: int = 100_000
     num_motion_bases: int = 10
@@ -77,6 +79,7 @@ class TrainConfig:
     validate_every: int = 50
     save_videos_every: int = 50
     use_2dgs: bool = False
+    exp_name: str = "debug"
 
 
 def main(cfg: TrainConfig):
@@ -111,6 +114,7 @@ def main(cfg: TrainConfig):
         cfg.lr,
         cfg.loss,
         cfg.optim,
+        cfg=cfg,
         work_dir=cfg.work_dir,
         port=cfg.port,
     )
@@ -187,17 +191,17 @@ def initialize_and_checkpoint_model(
         cfg.num_fg,
         cfg.num_bg,
         cfg.num_motion_bases,
+        cfg=cfg,
         vis=vis,
         port=port,
     )
     # run initial optimization
     Ks = train_dataset.get_Ks().to(device)
     w2cs = train_dataset.get_w2cs().to(device)
-    run_initial_optim(fg_params, motion_bases, tracks_3d, Ks, w2cs)
+    run_initial_optim(fg_params, motion_bases, tracks_3d, Ks, w2cs) # smoothness & onehot sparseness
     if vis and cfg.port is not None:
         server = get_server(port=cfg.port)
         vis_init_params(server, fg_params, motion_bases)
-
 
     camera_poses = init_trainable_poses(w2cs)
 
@@ -221,6 +225,7 @@ def init_model_from_tracks(
     num_fg: int,
     num_bg: int,
     num_motion_bases: int,
+    cfg: TrainConfig,
     vis: bool = False,
     port: int | None = None,
 ):
@@ -235,14 +240,14 @@ def init_model_from_tracks(
 
         ipdb.set_trace()
 
-    rot_type = "6d"
     cano_t = int(tracks_3d.visibles.sum(dim=0).argmax().item())
 
     guru.info(f"{cano_t=} {num_fg=} {num_bg=} {num_motion_bases=}")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     motion_bases, motion_coefs, tracks_3d = init_motion_params_with_procrustes(
-        tracks_3d, num_motion_bases, rot_type, cano_t, vis=vis, port=port
+        tracks_3d, num_motion_bases, cano_t, cfg=cfg, vis=vis, 
+        port=port
     )
     motion_bases = motion_bases.to(device)
 

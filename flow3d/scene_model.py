@@ -7,6 +7,7 @@ from gsplat.rendering import rasterization_2dgs
 from torch import Tensor
 
 from flow3d.params import GaussianParams, MotionBases, CameraScales, CameraPoses
+from flow3d.custom_params import BayesianMotionBases
 
 
 class SceneModel(nn.Module):
@@ -64,7 +65,7 @@ class SceneModel(nn.Module):
             quats: (G, B, 4)
         """
         assert self.bg is not None
-        return self.bg.params["means"], self.bg.get_quats()
+        return self.bg.params["means"], self.bg.get_quats(), {}
 
     def compute_transforms(
         self, ts: torch.Tensor, inds: torch.Tensor | None = None
@@ -72,8 +73,8 @@ class SceneModel(nn.Module):
         coefs = self.fg.get_coefs()  # (G, K)
         if inds is not None:
             coefs = coefs[inds]
-        transfms = self.motion_bases.compute_transforms(ts, coefs)  # (G, B, 3, 4)
-        return transfms
+        transfms, loss_dict = self.motion_bases.compute_transforms(ts, coefs, train=self.training)  # (G, B, 3, 4)
+        return transfms, loss_dict
 
     def compute_poses_fg(
         self, ts: torch.Tensor | None, inds: torch.Tensor | None = None
@@ -87,7 +88,7 @@ class SceneModel(nn.Module):
             means = means[inds]
             quats = quats[inds]
         if ts is not None:
-            transfms = self.compute_transforms(ts, inds)  # (G, B, 3, 4)
+            transfms, loss_dict = self.compute_transforms(ts, inds)  # (G, B, 3, 4)
             means = torch.einsum(
                 "pnij,pj->pni",
                 transfms,
@@ -105,21 +106,21 @@ class SceneModel(nn.Module):
         else:
             means = means[:, None]
             quats = quats[:, None]
-        return means, quats
+        return means, quats, loss_dict
 
     def compute_poses_all(
         self, ts: torch.Tensor | None
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        means, quats = self.compute_poses_fg(ts)
+        means, quats, loss_dict = self.compute_poses_fg(ts)
         if self.has_bg:
-            bg_means, bg_quats = self.compute_poses_bg()
+            bg_means, bg_quats, _ = self.compute_poses_bg()
             means = torch.cat(
                 [means, bg_means[:, None].expand(-1, means.shape[1], -1)], dim=0
             ).contiguous()
             quats = torch.cat(
                 [quats, bg_quats[:, None].expand(-1, means.shape[1], -1)], dim=0
             ).contiguous()
-        return means, quats
+        return means, quats, loss_dict 
 
     def get_colors_all(self) -> torch.Tensor:
         colors = self.fg.get_colors()
@@ -145,7 +146,7 @@ class SceneModel(nn.Module):
         return opacities
 
     @staticmethod
-    def init_from_state_dict(state_dict, prefix=""):
+    def init_from_state_dict(state_dict, cfg, prefix=""):
         fg = GaussianParams.init_from_state_dict(
             state_dict, prefix=f"{prefix}fg.params."
         )
@@ -154,9 +155,14 @@ class SceneModel(nn.Module):
             bg = GaussianParams.init_from_state_dict(
                 state_dict, prefix=f"{prefix}bg.params."
             )
-        motion_bases = MotionBases.init_from_state_dict(
-            state_dict, prefix=f"{prefix}motion_bases.params."
-        )
+        if any("var" in k for k in state_dict):
+            motion_bases = BayesianMotionBases.init_from_state_dict(
+                state_dict, cfg, prefix=f"{prefix}motion_bases.params."
+            )
+        else:
+            motion_bases = MotionBases.init_from_state_dict(
+                state_dict, cfg, prefix=f"{prefix}motion_bases.params."
+            )
         Ks = state_dict[f"{prefix}Ks"]
         w2cs = state_dict[f"{prefix}w2cs"]
         camera_poses = None
@@ -206,9 +212,9 @@ class SceneModel(nn.Module):
         W, H = img_wh
         pose_fnc = self.compute_poses_fg if fg_only else self.compute_poses_all
         N = self.num_fg_gaussians if fg_only else self.num_gaussians
-
+        loss_dict = None
         if means is None or quats is None:
-            means, quats = pose_fnc(
+            means, quats, loss_dict = pose_fnc(
                 torch.tensor([t], device=device) if t is not None else None
             )
             means = means[:, 0]
@@ -248,7 +254,7 @@ class SceneModel(nn.Module):
         if target_ts is not None:
             B = target_ts.shape[0]
             if target_means is None:
-                target_means, _ = pose_fnc(target_ts)  # [G, B, 3]
+                target_means, _, _ = pose_fnc(target_ts)  # [G, B, 3]
             if target_w2cs_clone is not None:
                 target_means = torch.einsum(
                     "bij,pbj->pbi",
@@ -351,4 +357,6 @@ class SceneModel(nn.Module):
         out_dict["acc"] = alphas
         out_dict["rend_normal"] = render_normals
         out_dict["surf_normal"] = surf_normals
+        if loss_dict is not None:
+            out_dict["loss_dict"] = loss_dict
         return out_dict

@@ -5,7 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
-from flow3d.transforms import cont_6d_to_rmat
+from flow3d.transforms import cont_6d_to_rmat, quat_to_rmat, quat_t_to_dq, dq_to_quat_t
 
 ###### Deprecated ######
 class CameraScales(nn.Module):
@@ -210,11 +210,14 @@ class GaussianParams(nn.Module):
 
 
 class MotionBases(nn.Module):
-    def __init__(self, rots, transls):
+    def __init__(self, rots, transls, cfg=None):
         super().__init__()
         self.num_frames = rots.shape[1]
         self.num_bases = rots.shape[0]
-        assert check_bases_sizes(rots, transls)
+        self.cfg = cfg
+        self.rot_type = cfg.motion.rot_type
+    
+        assert check_bases_sizes(rots, transls, self.rot_type)
         self.params = nn.ParameterDict(
             {
                 "rots": nn.Parameter(rots),
@@ -223,25 +226,107 @@ class MotionBases(nn.Module):
         )
 
     @staticmethod
-    def init_from_state_dict(state_dict, prefix="params."):
+    def init_from_state_dict(state_dict, cfg, prefix="params."):
         param_keys = ["rots", "transls"]
         assert all(f"{prefix}{k}" in state_dict for k in param_keys)
         args = {k: state_dict[f"{prefix}{k}"] for k in param_keys}
+        args['cfg'] = cfg
         return MotionBases(**args)
 
-    def compute_transforms(self, ts: torch.Tensor, coefs: torch.Tensor) -> torch.Tensor:
+    def cache_curr_state(self):
+        pass
+
+    ###############################################################
+    # aggregation method
+    ###############################################################
+    def compute_transforms(self, ts: torch.Tensor, coefs: torch.Tensor, train=False) -> torch.Tensor:
         """
         :param ts (B)
         :param coefs (G, K)
         returns transforms (G, B, 3, 4)
         """
-        transls = self.params["transls"][:, ts]  # (K, B, 3)
-        rots = self.params["rots"][:, ts]  # (K, B, 6)
-        transls = torch.einsum("pk,kni->pni", coefs, transls)
-        rots = torch.einsum("pk,kni->pni", coefs, rots)  # (G, B, 6)
-        rotmats = cont_6d_to_rmat(rots)  # (K, B, 3, 3)
-        return torch.cat([rotmats, transls[..., None]], dim=-1)
+        # motion combine
+        if self.rot_type == "6d":
+            transls = self.params["transls"][:, ts]  # (K, B, 3)
+            rots = self.params["rots"][:, ts]  # (K, B, 6)
+            transls = torch.einsum("pk,kni->pni", coefs, transls)
+            rots = torch.einsum("pk,kni->pni", coefs, rots)  # (G, B, 6)
+            rotmats = cont_6d_to_rmat(rots)  # (G, B, 3, 3)
+            return torch.cat([rotmats, transls[..., None]], dim=-1), {}
 
+        elif self.rot_type == "quat":
+            transls = self.params["transls"][:, ts]  # (K, B, 3)
+            transls = torch.einsum("pk,kni->pni", coefs, transls)
+            quat = self.params["rots"][:, ts]  # (K, B, 4)
+            quat = self.align_quat_to_max_coef(quat, coefs)
+            quat = torch.einsum("pk,pkni->pni", coefs, quat)  # (G, B, 4):
+            rotmats = quat_to_rmat(quat)  # (K, B, 3, 3)
+            return torch.cat([rotmats, transls[..., None]], dim=-1), {}
+    
+        elif self.rot_type == "dual_quat":
+            transls = self.params["transls"][:, ts]  # (K, B, 3)
+            quat = self.params["rots"][:, ts]  # (K, B, 4)
+            dual_quat = quat_t_to_dq(quat, transls) # (G, K, 8)
+            dual_quat = self.align_quat_to_max_coef(dual_quat, coefs)  # (G, K, B, 8)
+            dual_quat = torch.einsum("pk,pkni->pni", coefs, dual_quat)
+            quat, transls = dq_to_quat_t(dual_quat)
+            rotmats = quat_to_rmat(quat)
+            return torch.cat([rotmats, transls[..., None]], dim=-1), {}
+
+        elif self.rot_type == "bingham": 
+            transls = self.params["transls"][:, ts]  # (K, B, 3)
+            transls = torch.einsum("pk,kni->pni", coefs, transls)
+            quat = G_rots[:, ts]  # (G, B, 4)
+            commit_loss = bingham_commit_loss(G_rots, coefs, self.params["rots"])
+            rotmats = quat_to_rmat(quat)  # (K, B, 3, 3)
+            loss_dict = {'commit': copmmit_loss, 'recon': recon_loss}
+            return torch.cat([rotmats, transls[..., None]], dim=-1), loss_dict 
+
+    ###############################################################
+    # get stochastic values
+    ###############################################################
+    """
+        if self.stochastic:
+#            noise = torch.rand
+            return self.params["rots"][:, ts] + self.params["rots_var"][:, ts] * noise
+        else:
+            return self.params["rots"][:, ts]
+    
+    def get_transls(self, ts):
+        if self.stochastic:
+            
+            return self.params["transls"][:, ts] + self.params["transls_var"][:, ts] * noise
+        else:
+            return self.params["transls"][:, ts]
+    """
+
+
+    ###############################################################
+    # aligning quaternion with coef
+    ###############################################################
+    def align_quat_to_max_coef(self, rots, coef):
+        """
+        Modify quaternions in 'rots' by comparing each quaternion with the one corresponding to the maximum coefficient 
+        for each group in 'coef'. If the quaternions do not match, the sign of the quaternion is flipped.
+
+        Args:
+        rots (torch.Tensor): Quaternions of shape (K, ..., 4), where each quaternion is of the form (w, x, y, z).
+        coef (torch.Tensor): Coefficients of shape (G, K) representing the coefficients for each quaternion.
+
+        Returns:
+        torch.Tensor: Modified quaternions with shape (G, K, ..., 4).
+        """
+        *leading_dims, _ = rots.shape
+        G, B = coef.shape  # G is the number of groups, K is the basis num
+
+        rots_expanded = rots.unsqueeze(0).expand(G, *leading_dims, -1)  # Shape becomes (G, K, ..., 4)
+
+        max_coef_indices = coef.argmax(dim=-1)  # Shape is (G,)
+        max_quats = rots_expanded[range(G), max_coef_indices]  # Shape becomes (G, ..., 4)
+
+        signs = torch.sign(torch.sum(rots_expanded * max_quats.unsqueeze(1), dim=-1))  # Shape (G, K, ...)
+        modified_quat = rots_expanded * signs.unsqueeze(-1)  # Shape becomes (G, K, ..., 4)
+        return modified_quat
 
 def check_gaussian_sizes(
     means: torch.Tensor,
@@ -269,9 +354,15 @@ def check_gaussian_sizes(
     return leading_dims_match and dims_correct
 
 
-def check_bases_sizes(motion_rots: torch.Tensor, motion_transls: torch.Tensor) -> bool:
+def check_bases_sizes(motion_rots: torch.Tensor, motion_transls: torch.Tensor, rot_type: str) -> bool:
+    if rot_type == '6d':
+        rot_dim = 6
+    elif rot_type in ['quat', 'dual_quat']:
+        rot_dim = 4    
+    elif rot_type == 'bingham':
+        rot_dim = 8
     return (
-        motion_rots.shape[-1] == 6
+        motion_rots.shape[-1] == rot_dim
         and motion_transls.shape[-1] == 3
         and motion_rots.shape[:-2] == motion_transls.shape[:-2]
     )

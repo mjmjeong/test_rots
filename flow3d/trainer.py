@@ -10,6 +10,7 @@ from loguru import logger as guru
 from nerfview import CameraState
 from pytorch_msssim import SSIM
 from torch.utils.tensorboard import SummaryWriter  # type: ignore
+import wandb
 
 from flow3d.configs import LossesConfig, OptimizerConfig, SceneLRConfig
 from flow3d.loss_utils import (
@@ -32,6 +33,7 @@ class Trainer:
         lr_cfg: SceneLRConfig,
         losses_cfg: LossesConfig,
         optim_cfg: OptimizerConfig,
+        cfg, 
         # Logging.
         work_dir: str,
         port: int | None = None,
@@ -47,6 +49,7 @@ class Trainer:
         self.validate_every = validate_every
         self.validate_video_every = validate_video_every
         self.validate_viewer_assets_every = validate_viewer_assets_every
+        self.cache_prior_every = optim_cfg.cache_prior_every
 
         self.model = model
         self.num_frames = model.num_frames
@@ -70,7 +73,11 @@ class Trainer:
         }
 
         self.work_dir = work_dir
+        # 
+        wandb.tensorboard.patch(root_logdir=work_dir)
+        wandb.init(project='som-debug', sync_tensorboard=True, config=asdict(cfg), name=cfg.exp_name)
         self.writer = SummaryWriter(log_dir=work_dir)
+
         self.global_step = 0
         self.epoch = 0
 
@@ -118,11 +125,13 @@ class Trainer:
         guru.info(f"Loading checkpoint from {path}")
         ckpt = torch.load(path)
         state_dict = ckpt["model"]
-        model = SceneModel.init_from_state_dict(state_dict)
+        model = SceneModel.init_from_state_dict(state_dict, kwargs['cfg'])
         model = model.to(device)
         print(use_2dgs)
         model.use_2dgs = use_2dgs
         trainer = Trainer(model, device, *args, **kwargs)
+        del kwargs['cfg']
+        
         if "optimizers" in ckpt:
             trainer.load_checkpoint_optimizers(ckpt["optimizers"])
         if "schedulers" in ckpt:
@@ -196,6 +205,9 @@ class Trainer:
         if self.global_step % self.checkpoint_every == 0:
             self.save_checkpoint(f"{self.work_dir}/checkpoints/last.ckpt")
 
+        if self.global_step % self.cache_prior_every == 0:
+            self.model.motion_bases.cache_curr_state()
+
         return loss.item()
 
     def compute_losses(self, batch):
@@ -246,14 +258,14 @@ class Trainer:
 
         _tic = time.time()
         # (B, G, 3).
-        means, quats = self.model.compute_poses_all(ts)  # (G, B, 3), (G, B, 4)
+        means, quats, loss_dict = self.model.compute_poses_all(ts)  # (G, B, 3), (G, B, 4)
         device = means.device
         means = means.transpose(0, 1)
         quats = quats.transpose(0, 1)
         # [(N, G, 3), ...].
         target_ts_vec = torch.cat(target_ts)
         # (B * N, G, 3).
-        target_means, _ = self.model.compute_poses_all(target_ts_vec)
+        target_means, _, loss_dict_target = self.model.compute_poses_all(target_ts_vec)
         target_means = target_means.transpose(0, 1)
         target_mean_list = target_means.split(N)
         num_frames = self.model.num_frames
@@ -362,6 +374,15 @@ class Trainer:
             )
         loss += mask_loss * self.losses_cfg.w_mask
 
+        # sampling loss (bayesian or commit loss)
+        if any("kl" in k for k in loss_dict.keys()):
+            loss += loss_dict['kl_rots'] * self.losses_cfg.w_kl_rots
+            loss += loss_dict['kl_transls'] * self.losses_cfg.w_kl_transls
+        
+        if any("commit" in k for k in loss_dict.keys()):
+            loss += loss_dict['commit'] * self.losses_cfg.w_commit_loss # VQ
+            loss += loss_dict['recon'] * self.losses_cfg.w_recon_loss # VQ
+
         # (B * N, H * W, 3).
         pred_tracks_3d = (
             rendered_all["tracks_3d"].permute(0, 3, 1, 2, 4).reshape(-1, H * W, 3)  # type: ignore
@@ -444,7 +465,7 @@ class Trainer:
         # tracks should be smooth
         ts = torch.clamp(ts, min=1, max=num_frames - 2)
         ts_neighbors = torch.cat((ts - 1, ts, ts + 1))
-        transfms_nbs = self.model.compute_transforms(ts_neighbors)  # (G, 3n, 3, 4)
+        transfms_nbs, loss_dict_nbs = self.model.compute_transforms(ts_neighbors)  # (G, 3n, 3, 4)
         means_fg_nbs = torch.einsum(
             "pnij,pj->pni",
             transfms_nbs,

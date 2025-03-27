@@ -24,6 +24,8 @@ class BGLRConfig:
 class MotionLRConfig:
     rots: float = 1.6e-4
     transls: float = 1.6e-4
+    rots_var: float = 1.6e-5
+    transls_var: float = 1.6e-5
 
 @dataclass
 class CameraScalesLRConfig:
@@ -56,6 +58,11 @@ class LossesConfig:
     w_scale_var: float = 0.01
     w_z_accel: float = 1.0
 
+    w_commit: float = 0.0
+    w_recon: float = 0.0
+    w_kl_rots: float = 0.0
+    w_kl_transls: float = 0.0
+    
     # w_smooth_bases: float = 0.0
     # w_smooth_tracks: float = 0.0
     # w_scale_var: float = 0.0
@@ -80,3 +87,15 @@ class OptimizerConfig:
     cull_opacity_threshold: float = 0.1
     cull_scale_threshold: float = 0.5
     cull_screen_threshold: float = 0.15
+    ### Prior update
+    cache_prior_every: int = 1
+
+@dataclass
+class MotionConfig:
+    rot_type: str = "6d"
+    use_dual_quaternion: bool = False
+    init_rot_option: str = "align_quat"
+    basis_type: str = "default"
+    var_activation: str = "exp" # for bayesian
+    rots_var_init_value: int = -1
+    transls_var_init_value: int = -1

@@ -192,3 +192,36 @@ def compute_accel_loss(transls):
     accel = 2 * transls[:, 1:-1] - transls[:, :-2] - transls[:, 2:]
     loss = accel.norm(dim=-1).mean()
     return loss
+
+def kl_div_gaussian(pre_mean, curr_mean, pre_var, curr_var):
+    """
+    Compute the KL divergence between two Gaussian distributions.
+    
+    Args:
+        pre_mean (torch.Tensor): Mean of the prior distribution, shape (B, N).
+        curr_mean (torch.Tensor): Mean of the approximate posterior distribution, shape (B, N).
+        pre_var (torch.Tensor): Variance of the prior distribution, shape (B, N).
+        curr_var (torch.Tensor): Variance of the approximate posterior distribution, shape (B, N).
+    
+    Returns:
+        torch.Tensor: The KL divergence between the two distributions, shape (B,).
+    """
+    # Compute the KL divergence between two Gaussians (element-wise)
+    log_var_ratio = torch.log(curr_var / pre_var)  # log(σ2^2 / σ1^2)
+    var_ratio = curr_var / pre_var  #σ1^2 / σ2^2)
+
+    # Mean difference squared term: (μ2 - μ1)^2 / (2 * σ1^2)
+    mean_diff = (curr_mean - pre_mean)**2
+    mean_term = mean_diff / (2 * pre_var)
+    
+    # KL divergence formula (element-wise)
+    kl_div = 0.5 * (log_var_ratio + var_ratio + mean_term - 1)
+    return kl_div.mean()
+
+def kl_div_vonmise_fisher():
+    pass
+
+def reparameterize_vonmise_fisher(vmf_kappa, axis):
+    # sampling visualization
+    pass
+
