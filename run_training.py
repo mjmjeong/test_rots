@@ -1,7 +1,7 @@
 import os
 import os.path as osp
 import shutil
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from typing import Annotated
 from typing import Literal
@@ -80,6 +80,8 @@ class TrainConfig:
     save_videos_every: int = 50
     use_2dgs: bool = False
     exp_name: str = "debug"
+    project: str = "som-debug"
+    tags: list[str] = field(default_factory=list)
 
 
 def main(cfg: TrainConfig):

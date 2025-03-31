@@ -75,7 +75,7 @@ class Trainer:
         self.work_dir = work_dir
         # 
         wandb.tensorboard.patch(root_logdir=work_dir)
-        wandb.init(project='som-debug', sync_tensorboard=True, config=asdict(cfg), name=cfg.exp_name)
+        wandb.init(project=cfg.project, sync_tensorboard=True, config=asdict(cfg), name=cfg.exp_name, tags=cfg.tags)
         self.writer = SummaryWriter(log_dir=work_dir)
 
         self.global_step = 0
