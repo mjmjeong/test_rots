@@ -82,6 +82,7 @@ class TrainConfig:
     exp_name: str = "debug"
     project: str = "som-debug"
     tags: list[str] = field(default_factory=list)
+    build_init: str | None = None
 
 
 def main(cfg: TrainConfig):
@@ -99,7 +100,10 @@ def main(cfg: TrainConfig):
         yaml.dump(asdict(cfg), f, default_flow_style=False)
 
     # if checkpoint exists
-    ckpt_path = f"{cfg.work_dir}/checkpoints/last.ckpt"
+    if cfg.build_init is not None:
+        ckpt_path = f"outputs/init_checkpoints/{cfg.build_init}"
+    else:
+        ckpt_path = f"{cfg.work_dir}/checkpoints/last.ckpt"
     initialize_and_checkpoint_model(
         cfg,
         train_dataset,
@@ -108,7 +112,10 @@ def main(cfg: TrainConfig):
         vis=cfg.vis_debug,
         port=cfg.port,
     )
-
+ 
+    if cfg.build_init is not None:
+        raise Exception("Saving init")
+ 
     trainer, start_epoch = Trainer.init_from_checkpoint(
         ckpt_path,
         device,
