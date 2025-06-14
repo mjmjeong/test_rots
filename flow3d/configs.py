@@ -9,6 +9,7 @@ class FGLRConfig:
     quats: float = 1e-3
     colors: float = 1e-2
     motion_coefs: float = 1e-2
+    delta_quats: float = 1e-4
 
 
 @dataclass
@@ -68,6 +69,11 @@ class LossesConfig:
     # w_scale_var: float = 0.0
     # w_z_accel: float = 0.0
 
+    w_bing_commit: float = 0.0
+    w_bing_recon: float = 0.0
+    w_bing_intensity: float = 0.0
+    w_bing_smooth: float = 0.0
+
 
 @dataclass
 class OptimizerConfig:
@@ -99,3 +105,28 @@ class MotionConfig:
     var_activation: str = "exp" # for bayesian
     rots_var_init_value: int = -1
     transls_var_init_value: int = -1
+    #### initialization / timeseries
+    init_base_knn_criteria: str='velocity' # timeseries or not
+    num_iters_initial_optim: int = 1000 
+    #### bingham
+    init_opt_with_bing: bool = False
+
+
+@dataclass
+class GPConfig:
+    epochs: int = 5000
+    batch_size: int = 100000
+    transls_model: str = 'MultitaskGPModel'
+    rots_model: str = 'MultitaskGPModel'
+    grid_size: int = 50 
+    kernel: str = 'multitask'
+    transls_gp_lr: float = 0.001
+    rots_gp_lr: float = 0.001
+    confidence_thred: float = None
+    #num_tasks: 10, # basis num
+    #num_inducing=300,
+    #inducing_share=True,
+    #transls_lengthscale=0.1,
+    #rots_lengthscale=0.1,
+    #transls_kernel_type=1,
+    #rots_kernel_type=1,

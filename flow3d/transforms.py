@@ -3,6 +3,7 @@ from typing import Literal
 import roma
 import torch
 import torch.nn.functional as F
+from kornia.geometry.conversions import rotation_matrix_to_quaternion
 
 
 def rt_to_mat4(
@@ -37,6 +38,40 @@ def rmat_to_cont_6d(matrix):
     """
     return torch.cat([matrix[..., 0], matrix[..., 1]], dim=-1)
 
+def sixd_to_quat(six6d):
+    rmat = cont_6d_to_rmat(six6d)
+    quat = rotation_matrix_to_quaternion(rmat)
+    return quat
+
+
+def bingham_recon_mat(vec10):
+    """
+    Reconstruct 4x4 symmetric matrices from vec10 parameters.
+    
+    Parameters:
+    - vec10: torch.Tensor of shape (N, 10) containing the Bingham parameters
+    
+    Returns:
+    - matrices: torch.Tensor of shape (N, 4, 4)
+    """
+    N = vec10.shape[0]
+    matrices = torch.zeros(N, 4, 4, device=vec10.device)
+    
+    # Fill in the diagonal elements
+    matrices[:, 0, 0] = vec10[:, 0]  # a
+    matrices[:, 1, 1] = vec10[:, 1]  # b
+    matrices[:, 2, 2] = vec10[:, 2]  # c
+    matrices[:, 3, 3] = vec10[:, 3]  # d
+    
+    # Fill in the off-diagonal elements
+    matrices[:, 0, 1] = matrices[:, 1, 0] = vec10[:, 4]  # e
+    matrices[:, 0, 2] = matrices[:, 2, 0] = vec10[:, 5]  # f
+    matrices[:, 0, 3] = matrices[:, 3, 0] = vec10[:, 6]  # g
+    matrices[:, 1, 2] = matrices[:, 2, 1] = vec10[:, 7]  # h
+    matrices[:, 1, 3] = matrices[:, 3, 1] = vec10[:, 8]  # i
+    matrices[:, 2, 3] = matrices[:, 3, 2] = vec10[:, 9]  # j
+    
+    return matrices
 
 def cont_6d_to_rmat(cont_6d):
     """
@@ -214,3 +249,131 @@ def solve_procrustes(
     #     print("Something is wrong.")
     #     __import__("ipdb").set_trace()
     return sim3, (error.item(), error_before.item())
+
+def quat2bingham(quat, intensity=100):
+    axis = torch.rand(3, 4) # random axis    
+    axis_1 = quat
+    axis_2 = quat
+    axis_3 = quat
+
+    T = torch.ones(4)
+    for i in range(4):
+        T[:,:] = -1 * intensity
+
+
+
+    return bingham
+
+
+def quaternion_to_bingham_matrix(quaternions, intensity=1000):
+    """
+    Convert quaternions to Bingham matrices with specified intensity parameter.
+    
+    Args:
+        quaternions: Tensor of shape (...)x4 containing unit quaternions
+        intensity: Scalar value controlling the concentration (higher = more concentrated)
+                   Default 1000
+    
+    Returns:
+        Bingham matrices: Tensor of shape (...)x4x4
+    """    
+    # Normalize quaternions to ensure they're unit quaternions
+    q_norm = torch.norm(quaternions, dim=-1, keepdim=True)
+    quaternions = quaternions / q_norm
+    
+    N = quaternions.shape[0]
+    
+    # Create outer products of quaternions with themselves: q⊗q
+    # This creates a rank-1 projection matrix for each quaternion
+    outer_products = torch.matmul(
+        quaternions.unsqueeze(-1),  # Shape: Nx4x1
+        quaternions.unsqueeze(-2)   # Shape: Nx1x4
+    )  # Result shape: Nx4x4
+    
+
+    identity = torch.eye(4, device=quaternions.device, dtype=quaternions.dtype)
+    identity = identity.expand(*quaternions.shape[:-1], 4, 4)
+
+    # Compute Bingham matrices
+    bingham_matrices = -intensity * (identity - outer_products)
+
+    return bingham_matrices
+
+def bingham_mat2vec10(bing_mat):
+    """
+    Convert symmetric 4x4 Bingham matrices to a 10-parameter vector representation.
+
+    Args:
+        bing_mat: Tensor of shape (..., 4, 4) containing symmetric Bingham matrices.
+
+    Returns:
+        bing_param: Tensor of shape (..., 10) containing the unique elements of each symmetric matrix.
+    """
+    # Ensure input is a tensor
+    if not isinstance(bing_mat, torch.Tensor):
+        bing_mat = torch.tensor(bing_mat, dtype=torch.float32)
+
+    # Check that the last two dimensions are 4x4
+    if bing_mat.shape[-2:] != (4, 4):
+        raise ValueError("Input tensor must have shape (..., 4, 4)")
+
+    # Extract diagonal elements
+    diag_indices = torch.arange(4)
+    diag_elements = bing_mat[..., diag_indices, diag_indices]  # Shape: (..., 4)
+
+    # Extract upper triangular elements (excluding the diagonal)
+    upper_tri_indices = [(0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)]
+    upper_tri_elements = torch.stack([bing_mat[..., i, j] for i, j in upper_tri_indices] , -1)  # List of tensors with shape (...,)
+
+    # Concatenate all extracted elements
+    bing_param = torch.cat((diag_elements,upper_tri_elements), dim=-1)  # Shape: (..., 10)
+
+    return bing_param
+
+
+def bingham_vec10tomat(bing_param):
+    """
+    Convert 10-parameter representation to 4x4 Bingham matrices, with support for arbitrary batch dimensions.
+
+    Args:
+        bing_param: Tensor of shape (..., 10) representing the unique elements of each symmetric matrix
+    
+    Returns:
+        bing_mat: Tensor of shape (..., 4, 4) containing symmetric Bingham matrices
+    """
+    if not isinstance(bing_param, torch.Tensor):
+        bing_param = torch.tensor(bing_param, dtype=torch.float32)
+
+    *batch_shape, _ = bing_param.shape  # (..., 10) → batch_shape + [10]
+    bing_mat = torch.zeros((*batch_shape, 4, 4), device=bing_param.device, dtype=bing_param.dtype)
+
+    # Diagonal
+    bing_mat[..., 0, 0] = bing_param[..., 0]
+    bing_mat[..., 1, 1] = bing_param[..., 1]
+    bing_mat[..., 2, 2] = bing_param[..., 2]
+    bing_mat[..., 3, 3] = bing_param[..., 3]
+    
+    # Upper triangular
+    bing_mat[..., 0, 1] = bing_param[..., 4]
+    bing_mat[..., 0, 2] = bing_param[..., 5]
+    bing_mat[..., 0, 3] = bing_param[..., 6]
+    bing_mat[..., 1, 2] = bing_param[..., 7]
+    bing_mat[..., 1, 3] = bing_param[..., 8]
+    bing_mat[..., 2, 3] = bing_param[..., 9]
+    
+    # Symmetric lower triangular
+    bing_mat[..., 1, 0] = bing_param[..., 4]
+    bing_mat[..., 2, 0] = bing_param[..., 5]
+    bing_mat[..., 3, 0] = bing_param[..., 6]
+    bing_mat[..., 2, 1] = bing_param[..., 7]
+    bing_mat[..., 3, 1] = bing_param[..., 8]
+    bing_mat[..., 3, 2] = bing_param[..., 9]
+    
+    return bing_mat
+
+
+def get_rots_dim(rot_type):
+    if rot_type == '6d':
+        return 6
+    elif rot_type in ['quat', 'align_quat']:
+        return 4
