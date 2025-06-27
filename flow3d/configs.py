@@ -1,4 +1,5 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+
 
 
 @dataclass
@@ -92,7 +93,7 @@ class OptimizerConfig:
     ### Cull.
     cull_opacity_threshold: float = 0.1
     cull_scale_threshold: float = 0.5
-    cull_screen_threshold: float = 0.15
+    cull_screen_threshold: float = 0.15                                                                                                                                                                                                                                 
     ### Prior update
     cache_prior_every: int = 1
 
@@ -114,19 +115,46 @@ class MotionConfig:
 
 @dataclass
 class GPConfig:
-    epochs: int = 5000
-    batch_size: int = 100000
     transls_model: str = 'MultitaskGPModel'
     rots_model: str = 'MultitaskGPModel'
-    grid_size: int = 50 
-    kernel: str = 'multitask'
-    transls_gp_lr: float = 0.001
-    rots_gp_lr: float = 0.001
-    confidence_thred: float = None
-    #num_tasks: 10, # basis num
-    #num_inducing=300,
-    #inducing_share=True,
-    #transls_lengthscale=0.1,
-    #rots_lengthscale=0.1,
-    #transls_kernel_type=1,
-    #rots_kernel_type=1,
+    #########################################
+    # input x (uncertain input)
+    #########################################
+    x_rsample: str = 'none'
+    rsample_std: float = 0.1
+    #########################################
+    # inducing points
+    #########################################
+    inducing_num: int = 16
+    inducing_point_noise_scale: float = 0.0
+    inducing_min: float = -1
+    inducing_max: float = 1    
+    inducing_method: str = 'grid'
+    inducing_task_specific: bool = False
+    #########################################
+    # Kernel
+    #########################################
+    # hexplane
+    combine_type: str = 'prod'
+    # interpolation kernel
+    use_grid_kernel: bool = False
+    use_hexplane_grid_kernel: bool = False
+    grid_min: float = -1.1
+    grid_max: float = 1.1
+    grid_size: list = field(default_factory=lambda: [40, 40, 40, 160])
+    # nn strategy
+    knn: int = 32
+    # input kernel
+    use_separable_kernel: bool = False
+    # output kernel
+    use_multitask: bool = True
+    #########################################
+    # Optimization
+    #########################################
+    epochs: int = 5000
+    batch_size: int = 2000
+    transls_gp_lr: float = 0.1
+    rots_gp_lr: float = 0.1
+    confidence_thred: float = -1
+    #transls_lengthscale=0.1
+    #rots_lengthscale=0.1
