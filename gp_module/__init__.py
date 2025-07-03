@@ -1,5 +1,6 @@
 import torch
 from torch.utils.data import TensorDataset, DataLoader
+import time
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -16,17 +17,29 @@ from gp_module.utils import *
 class Motion_GP():
     def __init__(self, args):
         self.args = args
+        self.bbox = {}
         self.device = args.device
         
         self.transls_gp = eval(self.args.gp.transls_model)
         self.rots_gp = eval(self.args.gp.rots_model)
 
-    def get_dataset(self, transls, rots,  canonical_idx=0, confidence=None):
+    def get_dataset(self, transls, rots,  canonical_idx=0, confidence=None, valid_can_thre=None, delta_cano=True):
+        self.canonical_idx = canonical_idx
+        if valid_can_thre is not None and confidence is not None:
+            valid_cano_mask = confidence[:,canonical_idx, 0]>valid_can_thre
+            transls = transls[valid_cano_mask]
+            rots = rots[valid_cano_mask]
+            if confidence is not None:
+                confidence = confidence[valid_cano_mask]
+        self.delta_cano = delta_cano
+        self.transls_cano = transls[:, canonical_idx, :].unsqueeze(1)
+        self.rots_cano = rots[:, canonical_idx, :].unsqueeze(1)
+
         self.set_bbox(transls, 'transls')
         transls = self.bbox_normalize(transls, 'transls')
         self.set_bbox(rots, 'rots')
         rots = self.bbox_normalize(rots, 'rots')
-        
+
         num_data_points = transls.shape[0]
         total_time = transls.shape[1] # Time
         # X0, Y0, Z0 
@@ -40,10 +53,14 @@ class Motion_GP():
         can_confidence = can_confidence.unsqueeze(1).repeat(1, total_time, 1)
         
         train_x = torch.cat((can_xyz, tgt_time, can_confidence), dim=-1)
-        train_y = torch.cat((transls, rots, confidence), -1)
-    
-        self.viz_train_x = train_x[::10, :,:]
-        self.viz_train_y = train_y[::10, :,:]
+
+        if delta_cano:
+            train_y = torch.cat((transls-self.transls_cano, rots-self.rots_cano, confidence), -1)
+        else:
+            train_y = torch.cat((transls, rots, confidence), -1)
+
+        self.viz_train_x = train_x[::10, :,:][:10]
+        self.viz_train_y = train_y[::10, :,:][:10]
 
         train_x = train_x.reshape(num_data_points*total_time, -1)
         train_y = train_y.reshape(num_data_points*total_time, -1)
@@ -83,7 +100,7 @@ class Motion_GP():
         min_for_scaling = torch.floor(min_vals)
         max_for_scaling = torch.ceil(max_vals)
 
-        self.bbox = {f'{prefix}_min': min_for_scaling, f'{prefix}_max': max_for_scaling}
+        self.bbox.update({f'{prefix}_min': min_for_scaling, f'{prefix}_max': max_for_scaling})
     
     def bbox_normalize(self, data, prefix):
         min_for_scaling = self.bbox[f'{prefix}_min']
@@ -137,11 +154,11 @@ class Motion_GP():
             self.rots_gp_model.eval()
             self.rots_likelihood.eval()       
 
-    def fitting_gp(self, train_x, train_y):
+    def fitting_gp(self, train_x, train_y, skip_rots=False):
         if self.args.gp.transls_model in ['ExactGPModel']: 
-            self.fitting_exact_gp(train_x, train_y) # full
+            self.fitting_exact_gp(train_x, train_y, skip_rots=skip_rots) # full
         elif self.args.gp.transls_model in ['MultitaskVariationalGPModel', 'IndependentVariationalGPModel']:
-            self.fitting_variational_gp(train_x, train_y)
+            self.fitting_variational_gp(train_x, train_y, skip_rots=skip_rots)
         else:
             raise NotImplementedError("Check training loop selection")
 
@@ -160,8 +177,6 @@ class Motion_GP():
         y_rots = train_y[:, 3:-1] 
         y_confidence = train_y[:, -1:]
 
-        breakpoint()
-
         for i in range(self.args.gp.epochs):
             # reset gradient
             self.transls_optimizer.zero_grad()
@@ -174,7 +189,7 @@ class Motion_GP():
                 #, batch_confidence) 
 
                 rots_output = self.rots_gp_model(train_x)
-                rots_loss = -1 * self.rots_mll(rots_output, y_rots)
+                rots_loss = -1 * seflf.rots_mll(rots_output, y_rots)
                 #, batch_confidence)
 
                 loss = transls_loss + rots_loss
@@ -188,8 +203,7 @@ class Motion_GP():
                 print(f"[{i+1}] Loss: {loss.item():.4f}")
 
 
-    def fitting_variational_gp(self, train_x, train_y):
-
+    def fitting_variational_gp(self, train_x, train_y, skip_rots=False):
         train_x_confidence = train_x[..., -1:]
         train_x = train_x[..., :-1]
 
@@ -220,6 +234,7 @@ class Motion_GP():
         
         for i in range(self.args.gp.epochs):
             for batch_idx, (batch_x, batch_y, batch_x_conf, batch_y_conf) in enumerate(train_loader):
+                b_time = time.time()
                 # input x
                 batch_x = batch_x.to(self.device)
                 batch_x_before = batch_x
@@ -245,7 +260,10 @@ class Motion_GP():
                 rots_loss = -1 * self.rots_mll(rots_output, batch_y_rots)
                 #, batch_confidence)
 
-                loss = transls_loss + rots_loss
+                if skip_rots:
+                    loss = transls_loss
+                else:
+                    loss = transls_loss + rots_loss
                 loss.backward()
 
                 # TODO
@@ -254,14 +272,13 @@ class Motion_GP():
 
                 self.transls_optimizer.step()
                 self.rots_optimizer.step()
-
                 
-            if (i) % 1 == 0:
-                print(f"[{i+1}] Loss: {loss.item():.4f}")
+#            if (i) % 1 == 0:
+#                print(f"[{i+1}] Loss: {loss.item():.4f}")
             
-            if i % 100 == 0:
-                print('save_image')
-                self.plot_traj(self.viz_train_x, self.viz_train_y, name=self.args.exp_name, step=i//100, loss=loss.detach().item())
+#            if i % 1 == 0:
+#                print('save_image')
+#                self.plot_traj(self.viz_train_x, self.viz_train_y, name=self.args.exp_name, step=i, loss=loss.detach().item())
 
                     # Print some kernel parameters for monitoring
 #                    if hasattr(model.covar_module.data_covar_module, 'base_kernel'):
@@ -273,10 +290,29 @@ class Motion_GP():
 #                            print(f'  Spatial lengthscales: {spatial_ls.detach().numpy()}')
 #                            print(f'  Temporal lengthscale: {temporal_ls.detach().numpy()}')
 
-    def sampling(self, data, keep=False):
+    def sampling(self, data, chunk_size=None, denorm=False):
         x = data
-        transls_output = self.transls_gp_model(x)
-        rots_output = self.rots_gp_model(x)
+        if chunk_size is not None:
+            total_step = (len(data) //chunk_size)+1
+            transls_output, rots_output = [], []
+            for step in range(total_step):
+                try:
+                    x = data[step*chunk_size:(step+1)*chunk_size]
+                except:
+                    x = data[step*chunk_size:]
+                transls_output.append(self.transls_gp_model(x).mean.cpu())
+                rots_output.append(self.rots_gp_model(x).mean.cpu())
+            transls_output = torch.cat(transls_output, 0)
+            rots_output = torch.cat(rots_output, 0)
+        else:
+            transls_output = self.transls_gp_model(x)
+            rots_output = self.rots_gp_model(x)
+        if denorm:
+            transls_output = self.bbox_denormalize(transls_output, 'transls')
+            rots_output = self.bbox_denormalize(rots_output, 'rots')
+            if self.delta_cano:
+                transls_output += self.transls_cano
+                rots_output += self.rots_cano
         return transls_output, rots_output
 
     def recon_loss(self, transls_curr, rots_curr, confidence):

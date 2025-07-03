@@ -14,7 +14,7 @@ from loguru import logger as guru
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from flow3d.configs import LossesConfig, OptimizerConfig, SceneLRConfig, MotionConfig
+from flow3d.configs import LossesConfig, OptimizerConfig, SceneLRConfig, MotionConfig, GPConfig
 from flow3d.data import (
     BaseDataset,
     DavisDataConfig,
@@ -68,6 +68,7 @@ class TrainConfig:
     loss: LossesConfig
     optim: OptimizerConfig
     motion: MotionConfig
+    gp: GPConfig
     num_fg: int = 40_000
     num_bg: int = 100_000
     num_motion_bases: int = 10
@@ -92,12 +93,13 @@ def main(cfg: TrainConfig):
     )
     guru.info(f"Training dataset has {train_dataset.num_frames} frames")
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
     # save config
     os.makedirs(cfg.work_dir, exist_ok=True)
     with open(f"{cfg.work_dir}/cfg.yaml", "w") as f:
         yaml.dump(asdict(cfg), f, default_flow_style=False)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    cfg.device = device
 
     # if checkpoint exists
     if cfg.build_init is not None:
@@ -191,6 +193,7 @@ def initialize_and_checkpoint_model(
     vis: bool = False,
     port: int | None = None,
 ):
+
     if os.path.exists(ckpt_path):
         guru.info(f"model checkpoint exists at {ckpt_path}")
         return
@@ -207,7 +210,7 @@ def initialize_and_checkpoint_model(
     # run initial optimization
     Ks = train_dataset.get_Ks().to(device)
     w2cs = train_dataset.get_w2cs().to(device)
-    run_initial_optim(fg_params, motion_bases, tracks_3d, Ks, w2cs) # smoothness & onehot sparseness
+    run_initial_optim(fg_params, motion_bases, tracks_3d, Ks, w2cs, cfg) # smoothness & onehot sparseness 
     if vis and cfg.port is not None:
         server = get_server(port=cfg.port)
         vis_init_params(server, fg_params, motion_bases)
@@ -254,12 +257,14 @@ def init_model_from_tracks(
     guru.info(f"{cano_t=} {num_fg=} {num_bg=} {num_motion_bases=}")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    # TODO
     motion_bases, motion_coefs, tracks_3d = init_motion_params_with_procrustes(
         tracks_3d, num_motion_bases, cano_t, cfg=cfg, vis=vis, 
         port=port
     )
     motion_bases = motion_bases.to(device)
 
+    # TODO: 
     fg_params = init_fg_from_tracks_3d(cano_t, tracks_3d, motion_coefs)
     fg_params = fg_params.to(device)
 

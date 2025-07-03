@@ -99,24 +99,30 @@ class OptimizerConfig:
 
 @dataclass
 class MotionConfig:
+    #########################################
+    # preprocessing: tracks 3d
+    #########################################
+    use_gp_preprocessing: bool = False
+    num_iters_initial_optim: int = 1000 
+    filling_missing_tracks3d: str = 'interp' # interp, gp
+    init_base_knn_criteria: str = 'chronos_mean' # chronos_mean, chronos_first, ...
+    #########################################
+    # basis type
+    #########################################
     rot_type: str = "6d"
-    use_dual_quaternion: bool = False
     init_rot_option: str = "align_quat"
+    use_dual_quaternion: bool = False
     basis_type: str = "default"
     var_activation: str = "exp" # for bayesian
     rots_var_init_value: int = -1
     transls_var_init_value: int = -1
-    #### initialization / timeseries
-    init_base_knn_criteria: str='velocity' # timeseries or not
-    num_iters_initial_optim: int = 1000 
     #### bingham
     init_opt_with_bing: bool = False
 
-
 @dataclass
 class GPConfig:
-    transls_model: str = 'MultitaskGPModel'
-    rots_model: str = 'MultitaskGPModel'
+    transls_model: str = 'IndependentVariationalGPModel'
+    rots_model: str = 'IndependentVariationalGPModel'
     #########################################
     # input x (uncertain input)
     #########################################
@@ -125,7 +131,7 @@ class GPConfig:
     #########################################
     # inducing points
     #########################################
-    inducing_num: int = 16
+    inducing_num: int = 400
     inducing_point_noise_scale: float = 0.0
     inducing_min: float = -1
     inducing_max: float = 1    
@@ -151,10 +157,10 @@ class GPConfig:
     #########################################
     # Optimization
     #########################################
-    epochs: int = 5000
-    batch_size: int = 2000
-    transls_gp_lr: float = 0.1
-    rots_gp_lr: float = 0.1
-    confidence_thred: float = -1
+    epochs: int = 10
+    batch_size: int = 20000
+    transls_gp_lr: float = 0.01
+    rots_gp_lr: float = 0.01
+    confidence_thred: float = 0.8
     #transls_lengthscale=0.1
     #rots_lengthscale=0.1

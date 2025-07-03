@@ -27,10 +27,12 @@ from flow3d.loss_utils import (
     masked_l1_loss,
 )
 from flow3d.params import GaussianParams, MotionBases, CameraPoses
-from flow3d.custom_params import BayesianMotionBases
+from flow3d.custom_params import BayesianMotionBases, BinghamMotionBases
 from flow3d.tensor_dataclass import StaticObservations, TrackObservations
-from flow3d.transforms import cont_6d_to_rmat, rt_to_mat4, solve_procrustes
+from flow3d.transforms import cont_6d_to_rmat, rt_to_mat4, solve_procrustes, get_rots_dim
 from flow3d.vis.utils import draw_keypoints_video, get_server, project_2d_tracks
+
+from gp_module import Motion_GP
 
 def init_trainable_poses(w2cs: Tensor) -> CameraPoses:
     N, _, _ = w2cs.shape
@@ -129,6 +131,10 @@ def init_motion_params_with_procrustes(
     # sample centers and get initial se3 motion bases by solving procrustes
     means_cano = tracks_3d.xyz[:, cano_t].clone()  # [num_gaussians, 3]
 
+
+    ###########################################################
+    # 1. Preprocessing: outlier
+    ##############################################################
     # remove outliers
     scene_center = means_cano.median(dim=0).values
     print(f"{scene_center=}")
@@ -142,6 +148,62 @@ def init_motion_params_with_procrustes(
 
     tracks_3d = tracks_3d.filter_valid(valid_mask)
 
+    ###########################################################
+    # 2. Preprocessing: GP
+    ############################################################
+    # TODO:check visualization with port
+
+    if cfg.motion.use_gp_preprocessing or (cfg.motion.filling_missing_tracks3d=='gp'):
+        # init    
+        motion_gp = Motion_GP(cfg)
+        canonical_idx = tracks_3d.visibles.sum(0).argmax().item()
+    
+        # transls
+        xyz = cp.asarray(tracks_3d.xyz)
+        print(f"{xyz.shape=}")
+        visibles = cp.asarray(tracks_3d.visibles)
+        num_tracks = xyz.shape[0]
+        transls_interp = torch.tensor(batched_interp_masked(xyz, visibles)).cpu()
+
+        if vis and port is not None:
+            server = get_server(port)
+            try:
+                pts = tracks_3d.xyz.cpu().numpy()
+                clrs = tracks_3d.colors.cpu().numpy()
+
+                server.scene.add_point_cloud("canonical_points", pts[:, canonical_idx], clrs)
+                time.sleep(0.3)
+            except KeyboardInterrupt:
+                pass
+    
+        if vis and port is not None:
+            num_vis = 20
+            server = get_server(port=8890)
+            idcs = np.random.choice(num_tracks, num_vis)
+            labels = np.linspace(0, 1, num_vis)
+            vis_tracks_3d(server, tracks_3d.xyz[idcs], labels, name="raw_tracks")
+            vis_tracks_3d(server, transls_interp[idcs], labels, name="interp_tracks")
+
+        # rots / confidence
+        rots_dim = get_rots_dim(cfg.motion.rot_type)
+        dummy_rots = (tracks_3d.xyz[...,:1]).repeat(1,1,rots_dim)
+        confidence = tracks_3d.confidences.unsqueeze(-1)
+    
+        # actually we disregard uncertain points
+        train_x, train_y = motion_gp.get_dataset(tracks_3d.xyz, dummy_rots, canonical_idx=canonical_idx, confidence=confidence, valid_can_thre=0.5)
+        motion_gp.fitting_gp(train_x, train_y, skip_rots=True)
+        
+        # inference and save
+        with torch.no_grad():
+            gp_y_mean, _ = motion_gp.sampling(train_x[...,:-1].cuda(), chunk_size=50000, denorm=True)
+            
+        tracks_3d.gp_xyz = gp_y_mean.cpu()
+
+        if cfg.motion.use_gp_preprocessing:
+            breakpoint()    
+            tracks_3d.xyz = gp_y_mean.cpu()
+        del motion_gp 
+        
     if vis and port is not None:
         server = get_server(port)
         try:
@@ -156,8 +218,11 @@ def init_motion_params_with_procrustes(
 
     means_cano = means_cano[valid_mask]
 
+    ###########################################################
+    # 3. Initializatio XYZ basis: KNN of tracks 3d
+    ##############################################################
     sampled_centers, num_bases, labels = sample_initial_bases_centers(
-        cluster_init_method, cano_t, tracks_3d, num_bases
+        cluster_init_method, cano_t, tracks_3d, num_bases, cfg
     )
 
     # assign each point to the label to compute the cluster weight
@@ -173,6 +238,9 @@ def init_motion_params_with_procrustes(
 
     init_rots, init_ts = [], []
 
+    ###########################################################
+    # 4. Initializating rotation
+    ##############################################################
     if cfg.motion.rot_type in ["quat", "dual_quat"]:
         id_rot = torch.tensor([1.0, 0.0, 0.0, 0.0], device=device)
         rot_dim = 4
@@ -242,6 +310,9 @@ def init_motion_params_with_procrustes(
             prev_t = cur_t
         skipped_ts[cluster_id.item()] = cluster_skip_ts
 
+    ###########################################################
+    # 5. Post rotation processing: align quaternion
+    ##############################################################
     if "align_quat" in cfg.motion.init_rot_option and cfg.motion.rot_type in ['quat', 'dual_quat']:
         _, sort_indice = motion_coefs.mean(0).sort(descending=True)
         max_idx = sort_indice[0]
@@ -276,20 +347,26 @@ def init_motion_params_with_procrustes(
 
         ipdb.set_trace()
 
+    ###########################################################
+    # 6. Buidling final motion basis
+    ##############################################################
     if cfg.motion.basis_type == 'bayesian':
         bases = BayesianMotionBases(init_rots, init_ts, cfg=cfg)
     elif cfg.motion.basis_type == 'default':
         bases = MotionBases(init_rots, init_ts, cfg=cfg)
+    elif cfg.motion.basis_type == 'bingham':
+        bases = BinghamMotionBases(init_rots, init_ts, cfg=cfg)
+        
     return bases, motion_coefs, tracks_3d
 
 
 def run_initial_optim(
     fg: GaussianParams,
-    bases: Union[MotionBases, BayesianMotionBases],
+    bases: Union[MotionBases, BayesianMotionBases, BinghamMotionBases],
     tracks_3d: TrackObservations,
     Ks: torch.Tensor,
     w2cs: torch.Tensor,
-    num_iters: int = 1000,
+    cfg,
     use_depth_range_loss: bool = False,
 ):
     """
@@ -297,7 +374,8 @@ def run_initial_optim(
     :param motion_transls: [num_bases, num_frames, 3]
     :param motion_coefs: [num_bases, num_frames]
     :param means: [num_gaussians, 3]
-    """
+    """    
+    num_iters = cfg.motion.num_iters_initial_optim
     optimizer = torch.optim.Adam(
         [
             {"params": bases.params["rots"], "lr": 1e-2},
@@ -413,6 +491,14 @@ def run_initial_optim(
             f"{small_acc_loss_tracks.item():.3f} "
             f"{z_accel_loss.item():.3f} "
         )
+
+    # initialization + feature
+    # initialization + bingham
+    if type(bases) == BinghamMotionBases:
+        if not bases.init_opt_with_bing:
+            all_quat = bases.compute_all_transforms(coefs)
+            fg.init_quaternion(all_quat)
+            bases.init_bingham() 
 
 def random_quats(N: int) -> torch.Tensor:
     u = torch.rand(N, 1)
@@ -544,8 +630,8 @@ def vis_tracks_3d(
 
 
 def sample_initial_bases_centers(
-    mode: str, cano_t: int, tracks_3d: TrackObservations, num_bases: int
-):
+    mode: str, cano_t: int, tracks_3d: TrackObservations, num_bases: int, cfg
+    ):
     """
     :param mode: "farthest" | "hdbscan" | "kmeans"
     :param tracks_3d: [G, T, 3]
@@ -554,37 +640,50 @@ def sample_initial_bases_centers(
     """
     assert mode in ["farthest", "hdbscan", "kmeans"]
     means_canonical = tracks_3d.xyz[:, cano_t].clone()
-    # if mode == "farthest":
-    #     vis_mask = tracks_3d.visibles[:, cano_t]
-    #     sampled_centers, _ = sample_farthest_points(
-    #         means_canonical[vis_mask][None],
-    #         K=num_bases,
-    #         random_start_point=True,
-    #     )  # [1, num_bases, 3]
-    #     dists2centers = torch.norm(means_canonical[:, None] - sampled_centers, dim=-1).T
-    #     return sampled_centers, num_bases, dists2centers
 
-    # linearly interpolate missing 3d points
-    xyz = cp.asarray(tracks_3d.xyz)
-    print(f"{xyz.shape=}")
-    visibles = cp.asarray(tracks_3d.visibles)
+    ###########################################################
+    # 1. Interpolation (for missing region)
+    ##############################################################
+    filling_type = cfg.motion.filling_missing_tracks3d
+    if filling_type == 'interp':
+        # linearly interpolate missing 3d points
+        xyz = cp.asarray(tracks_3d.xyz)
+        print(f"{xyz.shape=}")
+        visibles = cp.asarray(tracks_3d.visibles)
+        num_tracks = xyz.shape[0]
+        xyz_interp = torch.tensor(batched_interp_masked(xyz, visibles)).cpu()
+        
+    elif filling_type == 'gp':
+        xyz_interp = tracks_3d.gp_xyz
 
-    num_tracks = xyz.shape[0]
-    xyz_interp = batched_interp_masked(xyz, visibles)
+    ###############################################################
+    # 2. Feature selection (velocity, time seiries feature extractor)
+    ###############################################################d
 
-    # num_vis = 50
-    # server = get_server(port=8890)
-    # idcs = np.random.choice(num_tracks, num_vis)
-    # labels = np.linspace(0, 1, num_vis)
-    # vis_tracks_3d(server, tracks_3d.xyz[idcs].get(), labels, name="raw_tracks")
-    # vis_tracks_3d(server, xyz_interp[idcs].get(), labels, name="interp_tracks")
-    # import ipdb; ipdb.set_trace()
+    if cfg.motion.init_base_knn_criteria == 'velocity':    
+        velocities = xyz_interp[:, 1:] - xyz_interp[:, :-1]
+        vel_dirs = ( velocities / (cp.linalg.norm(velocities, axis=-1, keepdims=True) + 1e-5)).reshape((num_tracks, -1))
 
-    velocities = xyz_interp[:, 1:] - xyz_interp[:, :-1]
-    vel_dirs = (
-        velocities / (cp.linalg.norm(velocities, axis=-1, keepdims=True) + 1e-5)
-    ).reshape((num_tracks, -1))
+    elif 'chronos' in cfg.motion.init_base_knn_criteria:
+        xyz_interp = xyz_interp 
+        st_time = time.time()
+        embeddings = get_chronos_embeddings(xyz_interp, concat=True)  
+        print(f"chronos duration: {time.time()-st_time}")
+        if 'mean' in cfg.motion.init_base_knn_criteria:
+            embeddings = embeddings[:,:-1, :].mean(dim=1)
+        elif 'first' in cfg.motion.init_base_knn_criteria:
+            embeddings = embeddings[:,0,:]
+        elif 'median' in cfg.motion.init_base_knn_criteria:
+            median = embeddings.size(1) // 2
+            embeddings = embeddings[:,median,:]
+        elif 'max' in cfg.motion.init_base_knn_criteria:
+            embeddings, _ = embeddings[:,:-1, :].max(dim=1)
 
+        vel_dirs = cp.asarray(embeddings.to(dtype=torch.float32))
+
+   ###############################################################
+    # 3. KNN
+    ###############################################################d
     # [num_bases, num_gaussians]
     if mode == "kmeans":
         model = KMeans(n_clusters=num_bases)
@@ -662,3 +761,33 @@ def batched_interp_masked(
             )  # (batch_num, batch_time, *)
             out[b : b + batch_num, m : m + batch_time] = x
     return out
+
+def get_chronos_embeddings(traj, chunk_size=2000, concat=False):
+    from chronos import ChronosPipeline
+    embeddings_ = {}
+    embeddings_['x'], embeddings_['y'], embeddings_['z'] = [], [], []
+    total_step = (len(traj) //chunk_size)+1
+    mapping = {'x' : 0, 'y' : 1, 'z' : 2}
+    traj = torch.tensor(traj)
+    pipeline = ChronosPipeline.from_pretrained(
+            "amazon/chronos-t5-small",
+            device_map="cuda",
+            torch_dtype=torch.bfloat16,
+        )
+    for coord in ['x', 'y', 'z']:
+        for step in range(total_step):
+            index = mapping[coord]
+            try:
+                context = traj[step*chunk_size:(step+1)*chunk_size, :, index]
+            except:
+                context = traj[step*chunk_size:, :, index]
+            
+            if len(context) == 0:
+                continue
+
+            embeddings, _ = pipeline.embed(context)
+            embeddings_[coord].append(embeddings)
+        embeddings_[coord] = torch.cat(embeddings_[coord], 0)
+    if concat:
+        embeddings_ = torch.cat([embeddings_['x'], embeddings_['y'], embeddings_['z']], -1)
+    return embeddings_
