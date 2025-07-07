@@ -9,6 +9,127 @@ import copy
 from flow3d.transforms import cont_6d_to_rmat, quat_to_rmat, quat_t_to_dq, dq_to_quat_t
 from flow3d.loss_utils import kl_div_gaussian, kl_div_vonmise_fisher, reparameterize_vonmise_fisher
 
+from flow3d.transforms import *
+
+
+class BinghamMotionBases(nn.Module):
+    def __init__(self, rots, transls, cfg=None):
+        super().__init__()
+        self.num_frames = rots.shape[1]
+        self.num_bases = rots.shape[0]
+        self.cfg = cfg
+        self.rot_type = cfg.motion.rot_type
+    
+        assert check_bases_sizes(rots, transls, self.rot_type)
+        self.params = nn.ParameterDict(
+            {
+                "rots": nn.Parameter(rots),
+                "transls": nn.Parameter(transls),
+            }
+        )
+        if cfg.motion.init_opt_with_bing:
+            self.init_opt_with_bing = True
+            self.init_bingham()
+        else:
+            self.init_opt_with_bing = False
+
+    def init_bingham(self):
+        rots = self.params["rots"]
+        if rots.size(-1) == 6:
+            rots = sixd_to_quat(rots)
+        
+        bingham_param = bingham_mat2vec10(quaternion_to_bingham_matrix(rots))
+        self.params = nn.ParameterDict(
+            {
+                "rots": nn.Parameter(bingham_param),
+#                "rots": nn.Parameter(rots),
+                "transls":  self.params["transls"]
+            }
+        )
+
+    @staticmethod
+    def init_from_state_dict(state_dict, cfg, prefix="params."):
+        param_keys = ["rots", "transls"]
+        assert all(f"{prefix}{k}" in state_dict for k in param_keys)
+        args = {k: state_dict[f"{prefix}{k}"] for k in param_keys}
+        args['cfg'] = cfg
+        return BinghamMotionBases(**args)
+
+    def cache_curr_state(self):
+        breakpoint() # Annealing for update
+        param_keys = ["rots", "transls"]
+        self.rot_cache = copy.deepcopy(self.params['rots'].detach())
+        self.transls_cache = copy.deepcopy(self.params['transls'].detach())
+
+
+    def compute_transforms_default(self, ts: torch.Tensor, coefs: torch.Tensor, train=False) -> torch.Tensor:
+        """
+        :param ts (B)
+        :param coefs (G, K)
+        returns transforms (G, B, 3, 4)
+        """
+        # motion combine
+        if self.rot_type == "6d":
+            transls = self.params["transls"][:, ts]  # (K, B, 3)
+            rots = self.params["rots"][:, ts]  # (K, B, 6)
+            transls = torch.einsum("pk,kni->pni", coefs, transls)
+            rots = torch.einsum("pk,kni->pni", coefs, rots)  # (G, B, 6)
+            rotmats = cont_6d_to_rmat(rots)  # (G, B, 3, 3)
+            return torch.cat([rotmats, transls[..., None]], dim=-1), {}
+
+        elif self.rot_type == "quat":
+            transls = self.params["transls"][:, ts]  # (K, B, 3)
+            transls = torch.einsum("pk,kni->pni", coefs, transls)
+            quat = self.params["rots"][:, ts]  # (K, B, 4)
+            #quat = self.align_quat_to_max_coef(quat, coefs)
+            quat = torch.einsum("pk,pkni->pni", coefs, quat)  # (G, B, 4):
+            rotmats = quat_to_rmat(quat)  # (K, B, 3, 3)
+            return torch.cat([rotmats, transls[..., None]], dim=-1), {}
+    
+        elif self.rot_type == "dual_quat":
+            transls = self.params["transls"][:, ts]  # (K, B, 3)
+            quat = self.params["rots"][:, ts]  # (K, B, 4)
+            dual_quat = quat_t_to_dq(quat, transls) # (G, K, 8)
+            dual_quat = self.align_quat_to_max_coef(dual_quat, coefs)  # (G, K, B, 8)
+            dual_quat = torch.einsum("pk,pkni->pni", coefs, dual_quat)
+            quat, transls = dq_to_quat_t(dual_quat)
+            rotmats = quat_to_rmat(quat)
+            return torch.cat([rotmats, transls[..., None]], dim=-1), {}
+
+    def compute_transforms(self, ts: torch.Tensor, coefs: torch.Tensor, d_quat: torch.Tensor, train=False) -> torch.Tensor:
+        """
+        :param ts (B)
+        :param coefs (G, K)
+        :param rots of gaussian: (G, T, 4)
+        returns transforms (G, B, 3, 4)
+        """
+        if d_quat is None:
+            return self.compute_transofrms_default(ts, coefs, train)
+
+        # transls       
+        transls = self.params["transls"][:, ts]  # (K, B, 3)
+        transls = torch.einsum("pk,kni->pni", coefs, transls)
+        
+        # rots: pritmitive
+        breakpoint()
+        primitive_quat = d_quat[:, ts] #  G, T, 4  -> G, 4
+        rotmats = quat_to_rmat(primitive_quat)
+
+        # rots: bingham
+        breakpoint()
+        bingham_param = self.params["rots"][:, ts]  # (B, 10)
+        loss_dict = compute_bingham_geomety(bingham_param)
+
+        # smoothness
+        loss_dict['bingham_smooth'] =  F.mse_loss(self.params["rots"][:,:-1]-self.params["rots"][:,1:])
+
+        # coeff computing
+        bingham_param = torch.einsum("pk,kni->pni", coefs, bingham)  # (G, B, 10)
+        loss_dict['bingham_recon'] = bingham_loglikelihood(bingham_param.detach(), G_quat)
+        loss_dict['bingham_commit'] = bingham_loglikelihood(bingham_param, G_quat.detach())
+        
+        return torch.cat([rotmats, transls[..., None]], dim=-1), loss_dict 
+
 class BayesianMotionBases(nn.Module):
     def __init__(self, rots, transls, rots_var=None, transls_var=None, cfg=None):
         super().__init__()
