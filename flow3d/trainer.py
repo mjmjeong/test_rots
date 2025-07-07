@@ -459,6 +459,8 @@ class Trainer:
         small_accel_loss = compute_se3_smoothness_loss(
             self.model.motion_bases.params["rots"],
             self.model.motion_bases.params["transls"],
+            self.losses_cfg.w_smooth_bases_rots,
+            self.losses_cfg.w_smooth_bases_transls,
         )
         loss += small_accel_loss * self.losses_cfg.w_smooth_bases
 

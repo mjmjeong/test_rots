@@ -669,15 +669,12 @@ def sample_initial_bases_centers(
         st_time = time.time()
         embeddings = get_chronos_embeddings(xyz_interp, concat=True)  
         print(f"chronos duration: {time.time()-st_time}")
-        if 'mean' in cfg.motion.init_base_knn_criteria:
-            embeddings = embeddings[:,:-1, :].mean(dim=1)
-        elif 'first' in cfg.motion.init_base_knn_criteria:
-            embeddings = embeddings[:,0,:]
-        elif 'median' in cfg.motion.init_base_knn_criteria:
-            median = embeddings.size(1) // 2
-            embeddings = embeddings[:,median,:]
+        if 'global' in cfg.motion.init_base_knn_criteria:
+            embeddings = embeddings[:,0, :]
+        elif 'mean' in cfg.motion.init_base_knn_criteria:
+            embeddings = embeddings[:,1:,:].mean(dim=1)
         elif 'max' in cfg.motion.init_base_knn_criteria:
-            embeddings, _ = embeddings[:,:-1, :].max(dim=1)
+            embeddings, _ = embeddings[:,1:,:].max(dim=1)
 
         vel_dirs = cp.asarray(embeddings.to(dtype=torch.float32))
 

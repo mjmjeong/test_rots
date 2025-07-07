@@ -56,6 +56,8 @@ class LossesConfig:
     w_track: float = 2.0
     w_mask: float = 1.0
     w_smooth_bases: float = 0.1
+    w_smooth_bases_rots: float = 1.0
+    w_smooth_bases_transls: float = 2.0
     w_smooth_tracks: float = 2.0
     w_scale_var: float = 0.01
     w_z_accel: float = 1.0
@@ -105,7 +107,7 @@ class MotionConfig:
     use_gp_preprocessing: bool = False
     num_iters_initial_optim: int = 1000 
     filling_missing_tracks3d: str = 'interp' # interp, gp
-    init_base_knn_criteria: str = 'chronos_mean' # chronos_mean, chronos_first, ...
+    init_base_knn_criteria: str = "velocity" # chronos_mean, chronos_first, ...
     #########################################
     # basis type
     #########################################
@@ -126,6 +128,7 @@ class GPConfig:
     #########################################
     # input x (uncertain input)
     #########################################
+    delta_cano: bool = False
     x_rsample: str = 'none'
     rsample_std: float = 0.1
     #########################################

@@ -258,8 +258,13 @@ class MotionBases(nn.Module):
             transls = self.params["transls"][:, ts]  # (K, B, 3)
             transls = torch.einsum("pk,kni->pni", coefs, transls)
             quat = self.params["rots"][:, ts]  # (K, B, 4)
-            quat = self.align_quat_to_max_coef(quat, coefs)
-            quat = torch.einsum("pk,pkni->pni", coefs, quat)  # (G, B, 4):
+
+            if "align_quat_agg" in self.cfg.motion.init_rot_option:
+                quat = self.align_quat_to_max_coef(quat, coefs) # chunking
+                quat = torch.einsum("pk,pkni->pni", coefs, quat)  # (G, B, 4):
+            else: 
+                quat = torch.einsum("pk,kni->pni", coefs, quat)  # (G, B, 4):
+            
             rotmats = quat_to_rmat(quat)  # (K, B, 3, 3)
             return torch.cat([rotmats, transls[..., None]], dim=-1), {}
     
@@ -267,8 +272,13 @@ class MotionBases(nn.Module):
             transls = self.params["transls"][:, ts]  # (K, B, 3)
             quat = self.params["rots"][:, ts]  # (K, B, 4)
             dual_quat = quat_t_to_dq(quat, transls) # (G, K, 8)
-            dual_quat = self.align_quat_to_max_coef(dual_quat, coefs)  # (G, K, B, 8)
-            dual_quat = torch.einsum("pk,pkni->pni", coefs, dual_quat)
+
+            if "align_quat_agg" in self.cfg.motion.init_rot_option:
+                dual_quat = self.align_quat_to_max_coef(dual_quat, coefs)  # (G, K, B, 8)
+                dual_quat = torch.einsum("pk,pkni->pni", coefs, dual_quat)
+            else:
+                dual_quat = torch.einsum("pk,kni->pni", coefs, dual_quat)
+            
             quat, transls = dq_to_quat_t(dual_quat)
             rotmats = quat_to_rmat(quat)
             return torch.cat([rotmats, transls[..., None]], dim=-1), {}
