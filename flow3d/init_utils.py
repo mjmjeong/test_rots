@@ -651,10 +651,10 @@ def sample_initial_bases_centers(
         print(f"{xyz.shape=}")
         visibles = cp.asarray(tracks_3d.visibles)
         num_tracks = xyz.shape[0]
-        xyz_interp = torch.tensor(batched_interp_masked(xyz, visibles)).cpu()
+        xyz_interp = batched_interp_masked(xyz, visibles)
         
     elif filling_type == 'gp':
-        xyz_interp = tracks_3d.gp_xyz
+        xyz_interp = cp.asarray(tracks_3d.gp_xyz)
 
     ###############################################################
     # 2. Feature selection (velocity, time seiries feature extractor)
@@ -665,8 +665,9 @@ def sample_initial_bases_centers(
         vel_dirs = ( velocities / (cp.linalg.norm(velocities, axis=-1, keepdims=True) + 1e-5)).reshape((num_tracks, -1))
 
     elif 'chronos' in cfg.motion.init_base_knn_criteria:
-        xyz_interp = xyz_interp 
+        xyz_interp = torch.tensor(xyz_interp).cpu()
         st_time = time.time()
+
         embeddings = get_chronos_embeddings(xyz_interp, concat=True)  
         print(f"chronos duration: {time.time()-st_time}")
         if 'global' in cfg.motion.init_base_knn_criteria:
