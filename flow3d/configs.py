@@ -147,12 +147,12 @@ class GPConfig:
     #########################################
     # hexplane
     combine_type: str = 'prod'
-    transls_lengthscale_xy = 0.001
-    transls_lengthscale_zt = 0.001
-    rots_lengthscale_xy = 0.001
-    rots_lengthscale_zt = 0.001
-    nu_matern_xy = 1.5
-    nu_matern_zt = 1.5
+    transls_lengthscale_xy: float = 0.001
+    transls_lengthscale_zt: float = 0.001
+    rots_lengthscale_xy: float = 0.001
+    rots_lengthscale_zt: float = 0.001
+    nu_matern_xy: float = 1.5
+    nu_matern_zt: float = 1.5
     # interpolation kernel
     #use_grid_kernel: bool = False
     #use_hexplane_grid_kernel: bool = False
