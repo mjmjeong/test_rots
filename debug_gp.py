@@ -5,6 +5,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from typing import Annotated
 from typing import Literal
+import wandb
 
 import numpy as np
 import torch
@@ -56,18 +57,12 @@ set_seed(42)
 
 @dataclass
 class TrainConfig:
-    work_dir: str
-    data: (
-        Annotated[iPhoneDataConfig, tyro.conf.subcommand(name="iphone")]
-        | Annotated[DavisDataConfig, tyro.conf.subcommand(name="davis")]
-        | Annotated[CustomDataConfig, tyro.conf.subcommand(name="custom")]
-        | Annotated[NvidiaDataConfig, tyro.conf.subcommand(name="nvidia")]
-    )
     lr: SceneLRConfig
     loss: LossesConfig
     optim: OptimizerConfig
     motion: MotionConfig
     gp: GPConfig
+    work_dir: str = 'search/wandb_sweep'
     num_fg: int = 40_000
     num_bg: int = 100_000
     num_motion_bases: int = 10
@@ -80,12 +75,75 @@ class TrainConfig:
     save_videos_every: int = 50
     use_2dgs: bool = False
     exp_name: str = "debug"
-    project: str = "som-debug"
+    project: str = "gp-offline"
     tags: list[str] = field(default_factory=list)
     build_init: str | None = None
 
 
 def main(cfg: TrainConfig):
+    # Initialize WandB - this will use sweep config when run by agent
+    name = f"{cfg.exp_name}_{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    run = wandb.init(
+        project=cfg.project,
+        name=name,
+        config=asdict(cfg)
+    )
+    
+    # CRITICAL: Update cfg with wandb.config values for sweep parameters
+    # This allows WandB to override the config values during sweeps
+    if wandb.config:
+        guru.info("Updating config with WandB sweep parameters")
+        # Update GP config parameters from wandb.config
+        gp_params = [
+                    'transls_model',
+                    'rots_model',
+                    'delta_cano',
+                    'x_rsample',
+                    'rsample_std',
+                    'inducing_num',
+                    'inducing_point_noise_scale',
+                    'inducing_min',
+                    'inducing_max',
+                    'nx',
+                    'nt',
+                    'inducing_method',
+                    'inducing_task_specific',
+                    'combine_type',
+                    'transls_lengthscale_xy',
+                    'transls_lengthscale_zt',
+                    'rots_lengthscale_xy',
+                    'rots_lengthscale_zt',
+                    'nu_matern_xy',
+                    'nu_matern_zt',
+                    'epochs',
+                    'batch_size',
+                    'transls_gp_lr',
+                    'rots_gp_lr',
+                    'confidence_thred'
+                ]
+                        
+        for param in gp_params:
+            wandb_key = f'gp.{param}'
+            if wandb_key in wandb.config:
+                setattr(cfg.gp, param, wandb.config[wandb_key])
+                guru.info(f"Updated cfg.gp.{param} = {wandb.config[wandb_key]}")
+        
+        # Handle the special boolean flag parameter
+        if 'gp.inducing_task_specific' in wandb.config:
+            # WandB will provide True/False, we set it directly to the config
+            cfg.gp.inducing_task_specific = wandb.config['gp.inducing_task_specific']
+            guru.info(f"Updated cfg.gp.inducing_task_specific = {cfg.gp.inducing_task_specific}")
+    
+        # Update other top-level parameters
+        top_level_params = ['num_epochs', 'batch_size', 'exp_name', 'project']
+        for param in top_level_params:
+            if param in wandb.config:
+                setattr(cfg, param, wandb.config[param])
+                guru.info(f"Updated cfg.{param} = {wandb.config[param]}")
+
+    os.makedirs(os.path.join('search/wandb_sweep'), exist_ok=True)
+    cfg.exp_name = os.path.join(f'search/wandb_sweep/{name}')
+    guru.info(f"Final config after WandB updates:\n{asdict(cfg)}")
     # import data    
     root_dir = 'observation/tmp_asset/'
     type_ = 'opt'
@@ -163,5 +221,63 @@ def main(cfg: TrainConfig):
     motion_gp.fitting_gp(train_x, train_y, skip_rots=True)
     motion_gp.save_csv("search_results.csv")
 
+    wandb.log({'val/loss':motion_gp.gp_opt_stat['loss'],
+                'val/lengthscale_xy':motion_gp.gp_opt_stat['transls_xy_lengthscale'],
+                'val/lengthscale_zt':motion_gp.gp_opt_stat['transls_zt_lengthscale'],
+                })
+    wandb.finish()
+
+def create_sweep_config():
+    """Create the WandB sweep configuration"""
+    sweep_config = {
+        'method': 'bayes',  # or 'grid', 'random'
+        'metric': {
+            'name': 'val/loss',  # Make sure this metric is logged in your training loop
+            'goal': 'minimize'
+        },
+        'program': 'debug_gp.py',
+        'parameters': {
+            # Fixed values for non-GP parameters
+            'batch_size': {'value': 8},
+            'project': {'value': 'Flow3D_GP_Sweeps'},
+            'gp.epochs': {'value': 500},
+            'gp.batch_size': {'values': [500, 1000, 5000, 10000]},
+            'gp.inducing_method': {'values': ['vel_chronos_kmeans']},
+            'gp.transls_gp_lr': {'values': [0.1, 0.01, 0.001, 0.005, 0.0001, 0.00001]},
+            'gp.combine_type': {'values': ['prod', 'add']},
+            'gp.transls_lengthscale_xy': {'values': [0.002, 0.001, 0.0005, 0.0002, 0.0001, 0.00001]},
+            'gp.transls_lengthscale_zt': {'values': [0.002, 0.001, 0.0005, 0.0002, 0.0001, 0.00001]},
+            'gp.nu_matern_xy': {'values': [0.5, 1.5, 2.5]},
+            'gp.nu_matern_zt': {'values': [0.5, 1.5, 2.5]},
+            'gp.nx': {'values': [4,6, 8, 10, 12]},
+            'gp.nt': {'values': [100, 150, 200]},
+        }
+    }
+
+    return sweep_config
+
 if __name__ == "__main__":
-    main(tyro.cli(TrainConfig))
+    # Check if this is being called by wandb agent
+
+    if 'WANDB_SWEEP_ID' in os.environ:
+        # Being called by wandb agent - run with tyro.cli
+        guru.info("Running as WandB sweep agent")
+        main(tyro.cli(TrainConfig))
+
+    else:
+        # Generate sweep configuration
+        guru.info("Generating WandB sweep configuration...")
+        sweep_config = create_sweep_config()
+        
+        sweep_config_path = "sweep_config_gp_only.yaml"
+        with open(sweep_config_path, 'w') as f:
+            yaml.dump(sweep_config, f, sort_keys=False)
+        
+        guru.info(f"WandB sweep configuration saved to {sweep_config_path}")
+        guru.info("\n--- WandB Setup & Run Instructions ---")
+        guru.info("1. Log in to WandB (if not already): `wandb login`")
+        guru.info("2. Initialize the sweep: `wandb sweep sweep_config_gp_only.yaml`")
+        guru.info("   (This will give you a SWEEP_ID)")
+        guru.info("3. Run agents: `wandb agent <SWEEP_ID>`")
+        guru.info("\nTo test locally without sweep, run:")
+        guru.info("python script.py --exp_name test_run")

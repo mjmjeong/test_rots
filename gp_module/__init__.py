@@ -4,6 +4,7 @@ import time
 
 import matplotlib.pyplot as plt
 import numpy as np
+import copy
 
 from gp_module.model import *
 from gp_module.kernel import *
@@ -354,27 +355,20 @@ class Motion_GP():
         plt.tight_layout()
         if name is None:
             name = 'tensor_visualization'
-        plt.savefig(f'{name}/{step}.png', dpi=300, bbox_inches='tight')
+        plt.savefig(f'{name}.png', dpi=300, bbox_inches='tight')
+        print(f"save image in {name}")
         plt.close()
         self.set_mode('train')
 
     def save_csv(self, filename="output.csv"):
-
-        save_dict = {
-                    "data": self.args.init_data,
-                    "name": self.args.exp_name,
-                    "epoch": self.args.gp.epochs,
-                    "batch": self.args.gp.batch_size,
-                    "lr": self.args.gp.transls_gp_lr, 
-                    "inducing_num": self.args.gp.nx * self.args.gp.nt, 
-                    "nx": self.args.gp.nx,
-                    "nt": self.args.gp.nt,
+        save_dict = {"data": self.args.init_data,
                     "data_num": self.args.data_num,
-                    "inducing_task_specific": self.args.gp.inducing_task_specific,
-                    "feature": self.args.gp.inducing_method, 
-                    }
-        save_dict.update(self.gp_opt_stat)
-
+                    } 
+        gp_opt_stat = copy.deepcopy(self.gp_opt_stat)
+        save_dict.update(gp_opt_stat)
+        update_dict = self.args.gp.__dict__
+        save_dict.update(update_dict)
+        
         file_exists = os.path.exists(filename)
         new_keys = list(save_dict.keys())
 
