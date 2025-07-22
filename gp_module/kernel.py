@@ -85,40 +85,66 @@ class Hexplane2DKernel(gpytorch.kernels.Kernel):
 
 
 class SelectiveMaternKernel(gpytorch.kernels.Kernel):
-    def __init__(self, dims, nu, batch_shape=torch.Size([])):
-        super().__init__(has_lengthscale=True)
+    def __init__(self, dims, nu, batch_shape=torch.Size([]), initial_lengthscale=None):
+        super().__init__()
         self.dims = dims
-        self.kernels = gpytorch.kernels.ScaleKernel(
-                gpytorch.kernels.MaternKernel(nu=nu, ard_num_dims=len(self.dims), batch_shape=batch_shape),
-                batch_shape=batch_shape)
+        
+        self.kernel = gpytorch.kernels.MaternKernel(
+                        nu=nu, 
+                        ard_num_dims=len(self.dims), 
+                        batch_shape=batch_shape,
+                        )
 
+
+        if initial_lengthscale is not None:
+            self.kernel.lengthscale = initial_lengthscale
+    
     def forward(self, x1, x2, **kwargs):
-        return self.kernels(x1[..., self.dims], x2[..., self.dims], **kwargs)
+        return self.kernel(x1[..., self.dims], x2[..., self.dims], **kwargs)
 
 # Hexplane kernel
 class HexplaneMaternKernel(gpytorch.kernels.Kernel):
-    def __init__(self, batch_shape=torch.Size([]), combine='add', nus=[0.5, 0.5]):
+    def __init__(self, batch_shape=torch.Size([]), combine='add', nus=None,
+                        initial_lengthscale_xy=None, initial_lengthscale_zt=None):
         super().__init__()
         
         # TODO: addictive / productive? Additive is more stable / productive is more complex but prune to overfitting
+        # TODO: scaling kernel is into Additive/Product
+        # TODO: do we need scaleKernel(MaternKernel)
+
+        assert (initial_lengthscale_xy is not None)
+        assert (initial_lengthscale_zt is not None)
+        assert (nus is not None)
+        
         if combine == 'add':
             self.kernels = gpytorch.kernels.AdditiveKernel(
-                SelectiveMaternKernel(dims=(0, 1), nu=nus[0], batch_shape=batch_shape),   # xy
-                SelectiveMaternKernel(dims=(1, 2), nu=nus[0], batch_shape=batch_shape),   # yz
-                SelectiveMaternKernel(dims=(2, 0), nu=nus[0], batch_shape=batch_shape),   # zx
-                SelectiveMaternKernel(dims=(0, 3), nu=nus[1], batch_shape=batch_shape),   # xt
-                SelectiveMaternKernel(dims=(1, 3), nu=nus[1], batch_shape=batch_shape),   # yt
-                SelectiveMaternKernel(dims=(2, 3), nu=nus[1], batch_shape=batch_shape),   # zt
+                SelectiveMaternKernel(dims=(0, 1), nu=nus[0], batch_shape=batch_shape, initial_lengthscale=initial_lengthscale_xy),  # xy
+                SelectiveMaternKernel(dims=(1, 2), nu=nus[0], batch_shape=batch_shape, initial_lengthscale=initial_lengthscale_xy),   # yz
+                SelectiveMaternKernel(dims=(2, 0), nu=nus[0], batch_shape=batch_shape, initial_lengthscale=initial_lengthscale_xy),   # zx
+                SelectiveMaternKernel(dims=(0, 3), nu=nus[1], batch_shape=batch_shape, initial_lengthscale=initial_lengthscale_zt),   # xt
+                SelectiveMaternKernel(dims=(1, 3), nu=nus[1], batch_shape=batch_shape, initial_lengthscale=initial_lengthscale_zt),   # yt
+                SelectiveMaternKernel(dims=(2, 3), nu=nus[1], batch_shape=batch_shape, initial_lengthscale=initial_lengthscale_zt),   # zt
             )
         elif combine == 'prod':
             self.kernels = gpytorch.kernels.ProductKernel(
-                SelectiveMaternKernel(dims=(0, 1), nu=nus[0], batch_shape=batch_shape),   # xy
-                SelectiveMaternKernel(dims=(1, 2), nu=nus[0], batch_shape=batch_shape),   # yz
-                SelectiveMaternKernel(dims=(2, 0), nu=nus[0], batch_shape=batch_shape),   # zx
-                SelectiveMaternKernel(dims=(0, 3), nu=nus[1], batch_shape=batch_shape),   # xt
-                SelectiveMaternKernel(dims=(1, 3), nu=nus[1], batch_shape=batch_shape),   # yt
-                SelectiveMaternKernel(dims=(2, 3), nu=nus[1], batch_shape=batch_shape),   # zt
+                SelectiveMaternKernel(dims=(0, 1), nu=nus[0], batch_shape=batch_shape, initial_lengthscale=initial_lengthscale_xy),   # xy
+                SelectiveMaternKernel(dims=(1, 2), nu=nus[0], batch_shape=batch_shape, initial_lengthscale=initial_lengthscale_xy),   # yz
+                SelectiveMaternKernel(dims=(2, 0), nu=nus[0], batch_shape=batch_shape, initial_lengthscale=initial_lengthscale_xy),   # zx
+                SelectiveMaternKernel(dims=(0, 3), nu=nus[1], batch_shape=batch_shape, initial_lengthscale=initial_lengthscale_zt),  # xt
+                SelectiveMaternKernel(dims=(1, 3), nu=nus[1], batch_shape=batch_shape, initial_lengthscale=initial_lengthscale_zt),   # yt
+                SelectiveMaternKernel(dims=(2, 3), nu=nus[1], batch_shape=batch_shape, initial_lengthscale=initial_lengthscale_zt),   # zt
             )
+
+    def get_average_lengthscale(self, type_, task_i=0):
+        if type_ == 'xy':
+            j_indice = [0,1,2]
+        elif type_ == 'zt':
+            j_indice = [3,4,5]
+        elif type_ == 'all':
+            j_indice = [0,1,2,3,4,5]
+
+        means = [self.kernels[task_i].kernels[j].kernel.lengthscale.mean() for j in j_indice]
+        return torch.stack(means).mean().item()
 
     def forward(self, x1, x2, **kwargs):
         return self.kernels(x1, x2, **kwargs)

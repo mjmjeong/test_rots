@@ -317,21 +317,43 @@ class MultitaskVariationalGPModel(ApproximateGP):
 class IndependentVariationalGPModel(ApproximateGP):
 
     @staticmethod
-    def init_from_data(args, prefix, train_x, train_y, likelihood):
+    def init_from_data(args, prefix, train_x, train_y, likelihood, others=None):
         if prefix == 'transls': 
             num_tasks = 3
         elif prefix == 'rots': 
             num_tasks = get_rots_dim(args.motion.rot_type)
 
-        # task shared
-        inducing_points = torch.linspace(-1, 1, args.gp.inducing_num).unsqueeze(-1).unsqueeze(0)
-        inducing_points = inducing_points.repeat(1, 1, train_x.size(-1))  
-        # task specific
-        #inducing_points2 = 2 * torch.rand(num_tasks, 50, 1) -1 
-        #inducing_points = inducing_points2.repeat(1,1,4)
-        return IndependentVariationalGPModel(args, inducing_points, num_tasks)  
+        inducing_points = create_adaptive_inducing_points(train_x, others, args)
+        train_x = inducing_points
 
-    def __init__(self, args, inducing_points, num_tasks):
+        print(f"----------------inducing points stats: {prefix}-----------------------")
+        print("Data shape:", train_x.shape)
+        print("Unique points:", torch.unique(train_x, dim=0).shape[0])
+
+        # Check for numerical issues
+        print("Data range:", train_x.min(), train_x.max())
+        print("Data std:", train_x.std())
+
+        # Check for exact duplicates
+        unique_points = torch.unique(train_x, dim=0)
+        print(f"Original points: {train_x.shape[0]}")
+        print(f"Unique points: {unique_points.shape[0]}")
+
+        # Check for near-duplicates (within 1e-6)
+        from torch import cdist
+        distances = torch.cdist(inducing_points.cpu(), inducing_points.cpu())
+        near_duplicates = (distances < 1e-6) & (distances > 0)
+        if near_duplicates.any():
+            print(f"Found {near_duplicates.sum()} near-duplicate pairs")
+        print("-------------------------------------------------------------")
+                    
+        if args.gp.inducing_task_specific:
+            inducing_points = inducing_points.unsqueeze(0)
+            inducing_points = inducing_points.repeat(num_tasks, 1, 1)  
+        return IndependentVariationalGPModel(args, inducing_points, num_tasks, prefix)  
+
+    def __init__(self, args, inducing_points, num_tasks, prefix):
+        
         variational_distribution = gpytorch.variational.CholeskyVariationalDistribution(
             inducing_points.size(-2), batch_shape=torch.Size([num_tasks])
         )
@@ -344,7 +366,17 @@ class IndependentVariationalGPModel(ApproximateGP):
         )
         super().__init__(variational_strategy)
         self.mean_module = gpytorch.means.ConstantMean(batch_shape=torch.Size([num_tasks]))
-        self.covar_module = HexplaneMaternKernel(nus=[0.5,0.5], batch_shape=torch.Size([num_tasks]), combine=args.gp.combine_type)
+
+        nu_xy = getattr(args.gp, "nu_matern_xy")
+        nu_zt = getattr(args.gp, "nu_matern_zt")
+        initial_lengthscale_xy = getattr(args.gp, f"{prefix}_lengthscale_xy")
+        initial_lengthscale_zt = getattr(args.gp, f"{prefix}_lengthscale_zt")
+
+        self.covar_module = HexplaneMaternKernel(nus=[nu_xy, nu_zt], 
+                                                batch_shape=torch.Size([num_tasks]), 
+                                                combine=args.gp.combine_type,
+                                                initial_lengthscale_xy=initial_lengthscale_xy,
+                                                initial_lengthscale_zt=initial_lengthscale_zt,)
 
     def forward(self, x):
         mean_x = self.mean_module(x)

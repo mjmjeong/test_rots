@@ -134,29 +134,34 @@ class GPConfig:
     #########################################
     # inducing points
     #########################################
-    inducing_num: int = 400
+    inducing_num: int = 100
     inducing_point_noise_scale: float = 0.0
     inducing_min: float = -1
     inducing_max: float = 1    
-    inducing_method: str = 'grid'
+    nx: int = 6
+    nt: int = 200
+    inducing_method: str = 'vel_chronos_kmeans' # 'RX-grid'
     inducing_task_specific: bool = False
     #########################################
     # Kernel
     #########################################
     # hexplane
     combine_type: str = 'prod'
+    transls_lengthscale_xy = 0.001
+    transls_lengthscale_zt = 0.001
+    rots_lengthscale_xy = 0.001
+    rots_lengthscale_zt = 0.001
+    nu_matern_xy = 1.5
+    nu_matern_zt = 1.5
     # interpolation kernel
-    use_grid_kernel: bool = False
-    use_hexplane_grid_kernel: bool = False
-    grid_min: float = -1.1
-    grid_max: float = 1.1
-    grid_size: list = field(default_factory=lambda: [40, 40, 40, 160])
+    #use_grid_kernel: bool = False
+    #use_hexplane_grid_kernel: bool = False
+    #grid_min: float = -1.1
+    #grid_max: float = 1.1
+    #grid_size: list = field(default_factory=lambda: [40, 40, 40, 160])
     # nn strategy
-    knn: int = 32
-    # input kernel
-    use_separable_kernel: bool = False
-    # output kernel
-    use_multitask: bool = True
+    #knn: int = 32
+    #use_multitask: bool = True
     #########################################
     # Optimization
     #########################################
@@ -164,6 +169,4 @@ class GPConfig:
     batch_size: int = 20000
     transls_gp_lr: float = 0.01
     rots_gp_lr: float = 0.01
-    confidence_thred: float = 0.8
-    #transls_lengthscale=0.1
-    #rots_lengthscale=0.1
+    confidence_thred: float = 0.0

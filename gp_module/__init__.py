@@ -5,7 +5,6 @@ import time
 import matplotlib.pyplot as plt
 import numpy as np
 
-
 from gp_module.model import *
 from gp_module.kernel import *
 from gp_module.likelihood import *
@@ -13,6 +12,8 @@ from gp_module.loss import *
 from gp_module.uncertainty import *
 from gp_module.utils import *
 
+import csv
+import os
 
 class Motion_GP():
     def __init__(self, args):
@@ -23,7 +24,7 @@ class Motion_GP():
         self.transls_gp = eval(self.args.gp.transls_model)
         self.rots_gp = eval(self.args.gp.rots_model)
 
-    def get_dataset(self, transls, rots,  canonical_idx=0, confidence=None, valid_can_thre=None, delta_cano=True):
+    def get_dataset(self, transls, rots,  canonical_idx=0, confidence=None, valid_can_thre=None, delta_cano=False):
         self.canonical_idx = canonical_idx
         if valid_can_thre is not None and confidence is not None:
             valid_cano_mask = confidence[:,canonical_idx, 0]>valid_can_thre
@@ -31,14 +32,15 @@ class Motion_GP():
             rots = rots[valid_cano_mask]
             if confidence is not None:
                 confidence = confidence[valid_cano_mask]
-        self.delta_cano = delta_cano
-        self.transls_cano = transls[:, canonical_idx, :].unsqueeze(1)
-        self.rots_cano = rots[:, canonical_idx, :].unsqueeze(1)
 
         self.set_bbox(transls, 'transls')
         transls = self.bbox_normalize(transls, 'transls')
         self.set_bbox(rots, 'rots')
         rots = self.bbox_normalize(rots, 'rots')
+
+        self.transls_cano = transls[:, canonical_idx, :].unsqueeze(1)
+        self.rots_cano = rots[:, canonical_idx, :].unsqueeze(1)
+        self.delta_cano = delta_cano
 
         num_data_points = transls.shape[0]
         total_time = transls.shape[1] # Time
@@ -59,8 +61,12 @@ class Motion_GP():
         else:
             train_y = torch.cat((transls, rots, confidence), -1)
 
-        self.viz_train_x = train_x[::10, :,:][:10]
-        self.viz_train_y = train_y[::10, :,:][:10]
+        if len(train_x) > 100:
+            self.viz_train_x = train_x[::10, :,:][:10]
+            self.viz_train_y = train_y[::10, :,:][:10]
+        else:
+            self.viz_train_x = train_x[:10, :,:]
+            self.viz_train_y = train_y[:10, :,:]
 
         train_x = train_x.reshape(num_data_points*total_time, -1)
         train_y = train_y.reshape(num_data_points*total_time, -1)
@@ -72,8 +78,12 @@ class Motion_GP():
 
         return train_x, train_y
         
-    def init_gp(self, train_x, train_y):
-
+    def init_gp(self, train_x, train_y, others=None):
+        try:
+            self.remove_gp()
+        except:
+            print("GP is not removed") 
+        
         train_y_transls = train_y[...,:3]
         train_y_rots = train_y[...,3:]
 
@@ -82,8 +92,8 @@ class Motion_GP():
         self.rots_likelihood = self.transls_gp.get_likelihood(self.args, "rots")
 
         # gp_model       
-        self.transls_gp_model = self.transls_gp.init_from_data(self.args, 'transls', train_x, train_y_transls, self.transls_likelihood)
-        self.rots_gp_model = self.rots_gp.init_from_data(self.args, 'rots', train_x, train_y_rots, self.rots_likelihood)
+        self.transls_gp_model = self.transls_gp.init_from_data(self.args, 'transls', train_x, train_y_transls, self.transls_likelihood, others=others)
+        self.rots_gp_model = self.rots_gp.init_from_data(self.args, 'rots', train_x, train_y_rots, self.rots_likelihood, others=others)
 
         # mll (loss)
         self.transls_mll = self.transls_gp.get_mll(self.transls_likelihood, self.transls_gp_model, train_x)
@@ -128,8 +138,7 @@ class Motion_GP():
             del self.transls_gp_model
             del self.rots_gp_model
             del self.transls_likelihood
-            del self.rots_likelihood
-            
+            del self.rots_likelihood            
             del self.transls_optimizer
             del self.rots_optimizer
         except:
@@ -163,10 +172,7 @@ class Motion_GP():
             raise NotImplementedError("Check training loop selection")
 
     def fitting_exact_gp(self, train_x, train_y):
-        # Initialization
-        self.remove_gp()
-        self.init_gp(train_x, train_y)
-        
+        breakpoint()
         self.set_device()
         self.set_mode('train')
 
@@ -202,39 +208,31 @@ class Motion_GP():
             if (i + 1) % 1 == 0:
                 print(f"[{i+1}] Loss: {loss.item():.4f}")
 
-
     def fitting_variational_gp(self, train_x, train_y, skip_rots=False):
+        
+        self.gp_opt_stat = {} 
         train_x_confidence = train_x[..., -1:]
         train_x = train_x[..., :-1]
 
         train_y_confidence = train_y[..., -1:]
         train_y = train_y[..., :-1]
-        
-        # Initialization
-        self.remove_gp()
-        self.init_gp(train_x, train_y)
 
         self.set_device()
         self.set_mode('train')
 
         train_x = train_x.to(self.device)
         train_y = train_y.to(self.device)
-        
-
-        y_transls = train_y[:, :3]
-        y_rots = train_y[:, 3:-1] 
-        y_confidence = train_y[:, -1:]
-
-        self.set_device()
-        self.set_mode('train')
 
         # define dataloader
         train_dataset = TensorDataset(train_x, train_y, train_x_confidence, train_y_confidence)
         train_loader = DataLoader(train_dataset, batch_size=self.args.gp.batch_size, shuffle=True) 
         
+        # TODO: check stability
+        #gpytorch.settings.cholesky_jitter(1e-3)
+        #gpytorch.settings.max_cholesky_size(2000)
+
         for i in range(self.args.gp.epochs):
             for batch_idx, (batch_x, batch_y, batch_x_conf, batch_y_conf) in enumerate(train_loader):
-                b_time = time.time()
                 # input x
                 batch_x = batch_x.to(self.device)
                 batch_x_before = batch_x
@@ -249,8 +247,7 @@ class Motion_GP():
                 # reset gradient
                 self.transls_optimizer.zero_grad()
                 self.rots_optimizer.zero_grad()
- 
-                # forward
+
                 transls_output = self.transls_gp_model(batch_x)
                 transls_loss = -1 * self.transls_mll(transls_output, batch_y_transls)
                 #, batch_confidence) 
@@ -272,23 +269,14 @@ class Motion_GP():
 
                 self.transls_optimizer.step()
                 self.rots_optimizer.step()
-                
-#            if (i) % 1 == 0:
-#                print(f"[{i+1}] Loss: {loss.item():.4f}")
-            
-#            if i % 1 == 0:
-#                print('save_image')
-#                self.plot_traj(self.viz_train_x, self.viz_train_y, name=self.args.exp_name, step=i, loss=loss.detach().item())
 
-                    # Print some kernel parameters for monitoring
-#                    if hasattr(model.covar_module.data_covar_module, 'base_kernel'):
-#                        base_kernel = model.covar_module.data_covar_module.base_kernel
-#                        if hasattr(base_kernel, 'kernels'):
-                            # Separable kernel
-#                            spatial_ls = base_kernel.kernels[0].base_kernel.lengthscale
-#                            temporal_ls = base_kernel.kernels[1].base_kernel.lengthscale
-#                            print(f'  Spatial lengthscales: {spatial_ls.detach().numpy()}')
-#                            print(f'  Temporal lengthscale: {temporal_ls.detach().numpy()}')
+            if (i) % 1 == 0:
+                print(f"[{i+1}] Loss: {loss.item():.4f}")
+
+        self.gp_opt_stat['loss'] = loss.item()
+        self.gp_opt_stat['transls_xy_lengthscale'] = self.transls_gp_model.covar_module.get_average_lengthscale('xy')
+        self.gp_opt_stat['transls_zt_lengthscale'] = self.transls_gp_model.covar_module.get_average_lengthscale('zt')
+        self.plot_traj(self.viz_train_x, self.viz_train_y, name=self.args.exp_name, step=i, gp_opt_stat=self.gp_opt_stat)
 
     def sampling(self, data, chunk_size=None, denorm=False):
         x = data
@@ -305,32 +293,37 @@ class Motion_GP():
             transls_output = torch.cat(transls_output, 0)
             rots_output = torch.cat(rots_output, 0)
         else:
-            transls_output = self.transls_gp_model(x)
-            rots_output = self.rots_gp_model(x)
+            transls_output = self.transls_gp_model(x).mean
+            rots_output = self.rots_gp_model(x).mean
+
         if denorm:
-            transls_output = self.bbox_denormalize(transls_output, 'transls')
-            rots_output = self.bbox_denormalize(rots_output, 'rots')
             if self.delta_cano:
                 transls_output += self.transls_cano
                 rots_output += self.rots_cano
+
+            transls_output = self.bbox_denormalize(transls_output, 'transls')
+            rots_output = self.bbox_denormalize(rots_output, 'rots')
         return transls_output, rots_output
 
     def recon_loss(self, transls_curr, rots_curr, confidence):
         pass
 
     # utils
-    def plot_traj(self, train_x, train_y, name=None, step=None, loss=None): 
+    def plot_traj(self, train_x, train_y, name=None, step=None, gp_opt_stat=None): 
         self.set_mode('eval')
+        loss = gp_opt_stat['loss']
+        
         train_x = train_x.to(self.device)
         T = train_x.size(1)
         N = train_x.size(0)
 
         train_x = train_x[..., :-1]
         train_x = train_x.reshape(N*T, -1)
-        transls_output, rots_output = self.sampling(train_x)
-        pred_transls = transls_output.mean.reshape(-1,T,3).detach().cpu()
+        transls_output, rots_output = self.sampling(train_x, chunk_size=5000)
+        pred_transls = transls_output.reshape(-1,T,3).detach().cpu()
         tgt_transls = train_y[:,:,:3]
 
+        
         # visualization
         grid_x = np.linspace(0,1,T)
         fig, axes = plt.subplots(3, 2, figsize=(12, 10))
@@ -361,6 +354,57 @@ class Motion_GP():
         plt.tight_layout()
         if name is None:
             name = 'tensor_visualization'
-        plt.savefig(f'{name}_{step}.png', dpi=300, bbox_inches='tight')
+        plt.savefig(f'{name}/{step}.png', dpi=300, bbox_inches='tight')
         plt.close()
         self.set_mode('train')
+
+    def save_csv(self, filename="output.csv"):
+
+        save_dict = {
+                    "data": self.args.init_data,
+                    "name": self.args.exp_name,
+                    "epoch": self.args.gp.epochs,
+                    "batch": self.args.gp.batch_size,
+                    "lr": self.args.gp.transls_gp_lr, 
+                    "inducing_num": self.args.gp.nx * self.args.gp.nt, 
+                    "nx": self.args.gp.nx,
+                    "nt": self.args.gp.nt,
+                    "data_num": self.args.data_num,
+                    "inducing_task_specific": self.args.gp.inducing_task_specific,
+                    "feature": self.args.gp.inducing_method, 
+                    }
+        save_dict.update(self.gp_opt_stat)
+
+        file_exists = os.path.exists(filename)
+        new_keys = list(save_dict.keys())
+
+        if not file_exists:
+            with open(filename, 'w', newline='') as csvfile:
+                writer = csv.DictWriter(csvfile, fieldnames=new_keys)
+                writer.writeheader()
+                writer.writerow(save_dict)
+        else:
+            with open(filename, 'r', newline='') as csvfile:
+                reader = csv.DictReader(csvfile)
+                existing_header = reader.fieldnames
+                existing_data = list(reader)
+
+            missing_keys = [key for key in new_keys if key not in existing_header]
+            
+            if missing_keys:
+                print(f"Adding new columns: {missing_keys}")
+                updated_fieldnames = existing_header + missing_keys
+                
+                with open(filename, 'w', newline='') as csvfile:
+                    writer = csv.DictWriter(csvfile, fieldnames=updated_fieldnames)
+                    writer.writeheader()
+                    
+                    for row in existing_data:
+                        writer.writerow(row)
+                    
+                    writer.writerow(save_dict)
+            else:
+                # No new columns, just append
+                with open(filename, 'a', newline='') as csvfile:
+                    writer = csv.DictWriter(csvfile, fieldnames=existing_header)
+                    writer.writerow(save_dict)

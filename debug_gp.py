@@ -88,9 +88,8 @@ class TrainConfig:
 def main(cfg: TrainConfig):
     # import data    
     root_dir = 'observation/tmp_asset/'
-    type_ = 'init'
-    #opt_artificial'
-    debugging_set = 100
+    type_ = 'opt'
+    debugging_set = 1000
 
     if type_ == 'init': 
         transls = torch.load(f"{root_dir}/init_3dtraj/xyz.pt", weights_only=False).cpu()
@@ -107,6 +106,7 @@ def main(cfg: TrainConfig):
         transls = torch.einsum("gb,btm->gtm", coef, transls_basis)
         rots = torch.einsum("gb,btm->gtm", coef, rots_basis)
         confidence = torch.randn_like(transls[:,:,0]).unsqueeze(-1)
+        confidence = torch.ones_like(confidence)
     
     elif type_ == 'opt_artificial':
         transls_basis = torch.load(f"{root_dir}transls_opt.pt", weights_only=False)
@@ -133,6 +133,8 @@ def main(cfg: TrainConfig):
         rots = rots[:debugging_set]
         confidence = confidence[:debugging_set]
         
+    cfg.init_data = type_
+    cfg.data_num = debugging_set
     # init model
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
@@ -142,7 +144,24 @@ def main(cfg: TrainConfig):
     canonical_idx = (confidence>0.5).sum(0).argmax().item()
     train_x, train_y = motion_gp.get_dataset(transls, rots, canonical_idx=canonical_idx, confidence=confidence)
     # run
-    motion_gp.fitting_gp(train_x, train_y)
+    os.makedirs(cfg.exp_name, exist_ok=True)
+    
+    others={}
+    data_scaled = motion_gp.bbox_normalize(transls, prefix='transls')
+    if motion_gp.delta_cano:
+        data_scaled = data - motion_gp.transls_cano
+
+    others['conf'] = confidence
+    others['traj'] = data_scaled
+
+    # Print the jitter setting for float64
+#        print(f"Cholesky jitter (float64): {jitter_setting.value(torch.float64)}")
+    # Print the jitter setting for float32
+#        print(f"Cholesky jitter (float32): {jitter_setting.value(torch.float32)}")
+
+    motion_gp.init_gp(train_x, train_y, others=others)
+    motion_gp.fitting_gp(train_x, train_y, skip_rots=True)
+    motion_gp.save_csv("search_results.csv")
 
 if __name__ == "__main__":
     main(tyro.cli(TrainConfig))
