@@ -288,7 +288,7 @@ class MultitaskVariationalGPModel(ApproximateGP):
                                                         add_noise_scale=args.gp.inducing_point_noise_scale)
 
         return MultitaskVariationalGPModel(args.gp, inducing_points, num_tasks)
-            
+
     @staticmethod
     def get_likelihood(args, prefix):
         if prefix == 'transls': 
@@ -317,39 +317,43 @@ class MultitaskVariationalGPModel(ApproximateGP):
 class IndependentVariationalGPModel(ApproximateGP):
 
     @staticmethod
-    def init_from_data(args, prefix, train_x, train_y, likelihood, others=None):
+    def init_from_data(args, prefix, train_x, train_y, likelihood, others=None, inducing_points=None):
         if prefix == 'transls': 
             num_tasks = 3
         elif prefix == 'rots': 
             num_tasks = get_rots_dim(args.motion.rot_type)
 
-        inducing_points = create_adaptive_inducing_points(train_x, others, args)
-        train_x = inducing_points
+        if inducing_points is None:
+            inducing_points = create_adaptive_inducing_points(train_x, others, args)
+            train_x = inducing_points
 
-        print(f"----------------inducing points stats: {prefix}-----------------------")
-        print("Data shape:", train_x.shape)
-        print("Unique points:", torch.unique(train_x, dim=0).shape[0])
+            print(f"----------------inducing points stats: {prefix}----------------")
+            print("Data shape:", train_x.shape)
+            print("Unique points:", torch.unique(train_x, dim=0).shape[0])
 
-        # Check for numerical issues
-        print("Data range:", train_x.min(), train_x.max())
-        print("Data std:", train_x.std())
+            # Check for numerical issues
+            print("Data range:", train_x.min(), train_x.max())
+            print("Data std:", train_x.std())
 
-        # Check for exact duplicates
-        unique_points = torch.unique(train_x, dim=0)
-        print(f"Original points: {train_x.shape[0]}")
-        print(f"Unique points: {unique_points.shape[0]}")
+            # Check for exact duplicates
+            unique_points = torch.unique(train_x, dim=0)
+            print(f"Original points: {train_x.shape[0]}")
+            print(f"Unique points: {unique_points.shape[0]}")
 
-        # Check for near-duplicates (within 1e-6)
-        from torch import cdist
-        distances = torch.cdist(inducing_points.cpu(), inducing_points.cpu())
-        near_duplicates = (distances < 1e-6) & (distances > 0)
-        if near_duplicates.any():
-            print(f"Found {near_duplicates.sum()} near-duplicate pairs")
-        print("-------------------------------------------------------------")
-                    
-        if args.gp.inducing_task_specific:
-            inducing_points = inducing_points.unsqueeze(0)
-            inducing_points = inducing_points.repeat(num_tasks, 1, 1)  
+            # Check for near-duplicates (within 1e-6)
+            from torch import cdist
+            distances = torch.cdist(inducing_points.cpu(), inducing_points.cpu())
+            near_duplicates = (distances < 1e-6) & (distances > 0)
+            if near_duplicates.any():
+                print(f"Found {near_duplicates.sum()} near-duplicate pairs")
+            print("-------------------------------------------------------------")
+                        
+            if args.gp.inducing_task_specific:
+                inducing_points = inducing_points.unsqueeze(0)
+                inducing_points = inducing_points.repeat(num_tasks, 1, 1)  
+        else:
+            print("initialized with inducing points!")
+
         return IndependentVariationalGPModel(args, inducing_points, num_tasks, prefix)  
 
     def __init__(self, args, inducing_points, num_tasks, prefix):

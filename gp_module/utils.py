@@ -7,7 +7,7 @@ from flow3d.vis.utils import draw_keypoints_video, get_server, project_2d_tracks
 from viser import ViserServer
 from matplotlib.pyplot import get_cmap
 from loguru import logger as guru
-
+import gc
 
 def vis_tracks_3d(
     server: ViserServer,
@@ -119,8 +119,8 @@ def create_adaptive_inducing_points(train_x, others, args):
     nt = args.gp.nt
     
     # full traj
-    conf = others['conf'] # TODO: normed?
-    traj = others['traj'] # TODO: normed?
+    conf = others['conf'] # just for visualization
+    traj = others['traj'] # normed trajectory
 
     xyz_interp = torch.tensor(others['traj']).cpu()
     T = xyz_interp.size(1)
@@ -132,8 +132,7 @@ def create_adaptive_inducing_points(train_x, others, args):
                             'chronos_kmeans', 'chronos_hdbscan',
                             'vel_chronos_kmeans', 'vel_chronos_hdbscan',
                             ])
-        from flow3d.init_utils import get_chronos_embeddings
-
+        
         mode = method.split('_')[-1]
 
         if 'vel' in method:
@@ -142,10 +141,15 @@ def create_adaptive_inducing_points(train_x, others, args):
             vel = xyz_interp
 
         if 'chronos' in method:
-            embeddings = get_chronos_embeddings(vel, concat=True)  
-            embeddings = embeddings[:,0, :]
+            with torch.no_grad():
+                from flow3d.init_utils import get_chronos_embeddings
+                embeddings = get_chronos_embeddings(vel, concat=True)  
+                embeddings = embeddings[:,0, :] # first idx = global context
         else:
             embeddings = vel.reshape(xyz_interp.size(0), -1)
+
+        torch.cuda.empty_cache()
+        gc.collect()
             
         vel_dirs = cp.asarray(embeddings.to(dtype=torch.float32))
 
@@ -166,6 +170,7 @@ def create_adaptive_inducing_points(train_x, others, args):
         distances = torch.sum((centers_expanded - embeddings_expanded) ** 2, dim=2)  # (basis, traj_num)
         closest_indices = torch.argmin(distances, dim=1).cpu()
 
+        """
         server = get_server(port=8890)
         labels = np.linspace(0, 1, nx)
         cmap = get_cmap("gist_rainbow")
@@ -180,7 +185,8 @@ def create_adaptive_inducing_points(train_x, others, args):
             colors_cluster = np.repeat(colors_cluster, num_vis, axis=0)[:num_vis]
             labels = labels[:num_vis]
             vis_tracks_3d(server, xyz_np[mask][:num_vis], labels, name=f"cluster_tracks_{i}", colors=colors_cluster)
-
+        """
+        
         times =  torch.linspace(-1, 1, T).reshape(1,T,1).repeat(N,1,1)
         xyz_interp = torch.cat((xyz_interp, times), -1)
         inducing_points = xyz_interp[closest_indices, ::time_gap].reshape(-1, 4)
@@ -243,6 +249,8 @@ def create_adaptive_inducing_points(train_x, others, args):
         noise = torch.randn_like(inducing_points) * args.gp.inducing_point_noise_scale
         inducing_points = inducing_points + noise
 
+    torch.cuda.empty_cache()
+    gc.collect()
     return inducing_points
 
 

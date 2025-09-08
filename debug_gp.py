@@ -39,7 +39,7 @@ from flow3d.trainer import Trainer
 from flow3d.validator import Validator
 from flow3d.vis.utils import get_server
 from flow3d.params import CameraScales
-from gp_module import Motion_GP
+from gp_module import MotionGP
 
 torch.set_float32_matmul_precision("high")
 
@@ -141,13 +141,14 @@ def main(cfg: TrainConfig):
                 setattr(cfg, param, wandb.config[param])
                 guru.info(f"Updated cfg.{param} = {wandb.config[param]}")
 
-    os.makedirs(os.path.join('search/wandb_sweep'), exist_ok=True)
-    cfg.exp_name = os.path.join(f'search/wandb_sweep/{name}')
+    os.makedirs(os.path.join('search/full_wandb_sweep'), exist_ok=True)
+    cfg.exp_name = os.path.join(f'search/full_wandb_sweep/{name}')
+    #cfg.exp_name = name
     guru.info(f"Final config after WandB updates:\n{asdict(cfg)}")
     # import data    
     root_dir = 'observation/tmp_asset/'
     type_ = 'opt'
-    debugging_set = 1000
+    debugging_set = -1
 
     if type_ == 'init': 
         transls = torch.load(f"{root_dir}/init_3dtraj/xyz.pt", weights_only=False).cpu()
@@ -185,7 +186,7 @@ def main(cfg: TrainConfig):
 
         transls += noise_transls
         rots += noise_rots
-  
+
     if debugging_set > 0:
         transls = transls[:debugging_set]
         rots = rots[:debugging_set]
@@ -198,32 +199,38 @@ def main(cfg: TrainConfig):
     print(f"Using device: {device}")
     cfg.device = device
 
-    motion_gp = Motion_GP(cfg)
-    canonical_idx = (confidence>0.5).sum(0).argmax().item()
-    train_x, train_y = motion_gp.get_dataset(transls, rots, canonical_idx=canonical_idx, confidence=confidence)
+    motion_gp = MotionGP(cfg)    
+    train_x, train_y = motion_gp.get_training_dataset(transls, rots, confidence_weights=confidence)
     # run
     os.makedirs(cfg.exp_name, exist_ok=True)
     
-    others={}
-    data_scaled = motion_gp.bbox_normalize(transls, prefix='transls')
-    if motion_gp.delta_cano:
-        data_scaled = data - motion_gp.transls_cano
-
-    others['conf'] = confidence
-    others['traj'] = data_scaled
-
     # Print the jitter setting for float64
 #        print(f"Cholesky jitter (float64): {jitter_setting.value(torch.float64)}")
     # Print the jitter setting for float32
 #        print(f"Cholesky jitter (float32): {jitter_setting.value(torch.float32)}")
 
-    motion_gp.init_gp(train_x, train_y, others=others)
-    motion_gp.fitting_gp(train_x, train_y, skip_rots=True)
+    if not motion_gp.is_trained:
+        # Full Traj (even with messy)
+        others={}
+        data_scaled = motion_gp.normalize_to_bbox(transls, prefix='transls')
+        if motion_gp.delta_cano:
+            data_scaled = data - motion_gp.transls_cano
+        others['conf'] = confidence
+        others['traj'] = data_scaled
+        motion_gp.initialize_gp_models(train_x, train_y, others=others)
+    
+#    motion_gp.is_trained = True
+    motion_gp.training_gp_models(train_x, train_y, skip_rots=True)
     motion_gp.save_csv("search_results.csv")
-
-    wandb.log({'val/loss':motion_gp.gp_opt_stat['loss'],
-                'val/lengthscale_xy':motion_gp.gp_opt_stat['transls_xy_lengthscale'],
-                'val/lengthscale_zt':motion_gp.gp_opt_stat['transls_zt_lengthscale'],
+    dict_ = motion_gp.get_state_dict()
+    torch.save(dict_, 'test_ckpt_0.pth')
+    gp_state_dict = torch.load('test_ckpt_0.pth')
+    motion_gp2 = MotionGP(cfg)
+    motion_gp2 = motion_gp2.initialize_gp_models_from_state_dict(gp_state_dict, cfg)
+    
+    wandb.log({'val/loss':motion_gp.optimization_stats['loss'],
+                'val/lengthscale_xy':motion_gp.optimization_stats['transls_xy_lengthscale'],
+                'val/lengthscale_zt':motion_gp.optimization_stats['transls_zt_lengthscale'],
                 })
     wandb.finish()
 
@@ -240,25 +247,56 @@ def create_sweep_config():
             # Fixed values for non-GP parameters
             'batch_size': {'value': 8},
             'project': {'value': 'Flow3D_GP_Sweeps'},
-            'gp.epochs': {'value': 500},
-            'gp.batch_size': {'values': [500, 1000, 5000, 10000]},
+            'gp.epochs': {'value': 100},
+            'gp.batch_size': {'values': [5000]},
             'gp.inducing_method': {'values': ['vel_chronos_kmeans']},
-            'gp.transls_gp_lr': {'values': [0.1, 0.01, 0.001, 0.005, 0.0001, 0.00001]},
+            'gp.transls_gp_lr': {'values': [0.1, 0.01, 0.001, 0.005, 0.0001]},
             'gp.combine_type': {'values': ['prod', 'add']},
             'gp.transls_lengthscale_xy': {'values': [0.002, 0.001, 0.0005, 0.0002, 0.0001, 0.00001]},
             'gp.transls_lengthscale_zt': {'values': [0.002, 0.001, 0.0005, 0.0002, 0.0001, 0.00001]},
-            'gp.nu_matern_xy': {'values': [0.5, 1.5, 2.5]},
-            'gp.nu_matern_zt': {'values': [0.5, 1.5, 2.5]},
-            'gp.nx': {'values': [4,6, 8, 10, 12]},
-            'gp.nt': {'values': [100, 150, 200]},
+            'gp.nu_matern_xy': {'values': [0.5, 1.5]},
+            'gp.nu_matern_zt': {'values': [0.5, 1.5]},
+            'gp.nx': {'values': [6]},
+            'gp.nt': {'values': [200]},
         }
     }
 
     return sweep_config
 
+
+def create_sweep_config():
+    """Create the WandB sweep configuration"""
+    sweep_config = {
+        'method': 'bayes',  # or 'grid', 'random'
+        'metric': {
+            'name': 'val/loss',  # Make sure this metric is logged in your training loop
+            'goal': 'minimize'
+        },
+        'program': 'debug_gp.py',
+        'parameters': {
+            # Fixed values for non-GP parameters
+            'batch_size': {'value': 8},
+            'project': {'value': 'full_init_search'},
+            'gp.epochs': {'value': 3},
+            'gp.batch_size': {'values': [5000]},
+            'gp.inducing_method': {'values': ['vel_chronos_kmeans']},
+            'gp.transls_gp_lr': {'values': [0.1, 0.01, 0.001, 0.005, 0.0001]},
+            'gp.transls_lengthscale_xy': {'values': [0.002, 0.001, 0.0005]},
+            'gp.transls_lengthscale_zt': {'values': [0.002, 0.001, 0.0005]},
+            'gp.nu_matern_xy': {'values': [0.5, 1.5]},
+            'gp.nu_matern_zt': {'values': [0.5, 1.5]},
+            'gp.nx': {'values': [6]},
+            'gp.nt': {'values': [200]},
+        }
+    }
+    return sweep_config
+
 if __name__ == "__main__":
     # Check if this is being called by wandb agent
 
+#   guru.info("Running as WandB sweep agent")
+    main(tyro.cli(TrainConfig))
+    """
     if 'WANDB_SWEEP_ID' in os.environ:
         # Being called by wandb agent - run with tyro.cli
         guru.info("Running as WandB sweep agent")
@@ -281,3 +319,4 @@ if __name__ == "__main__":
         guru.info("3. Run agents: `wandb agent <SWEEP_ID>`")
         guru.info("\nTo test locally without sweep, run:")
         guru.info("python script.py --exp_name test_run")
+    """
