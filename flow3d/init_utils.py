@@ -32,7 +32,8 @@ from flow3d.tensor_dataclass import StaticObservations, TrackObservations
 from flow3d.transforms import cont_6d_to_rmat, rt_to_mat4, solve_procrustes, get_rots_dim
 from flow3d.vis.utils import draw_keypoints_video, get_server, project_2d_tracks
 
-from gp_module import Motion_GP
+from gp_module import MotionGP
+import gc
 
 def init_trainable_poses(w2cs: Tensor) -> CameraPoses:
     N, _, _ = w2cs.shape
@@ -155,7 +156,7 @@ def init_motion_params_with_procrustes(
 
     if cfg.motion.use_gp_preprocessing or (cfg.motion.filling_missing_tracks3d=='gp'):
         # init    
-        motion_gp = Motion_GP(cfg)
+        motion_gp = MotionGP(cfg)
         canonical_idx = tracks_3d.visibles.sum(0).argmax().item()
     
         # transls
@@ -760,13 +761,13 @@ def batched_interp_masked(
             out[b : b + batch_num, m : m + batch_time] = x
     return out
 
-def get_chronos_embeddings(traj, chunk_size=2000, concat=False):
+def get_chronos_embeddings(traj, chunk_size=1000, concat=False):
     from chronos import ChronosPipeline
     embeddings_ = {}
     embeddings_['x'], embeddings_['y'], embeddings_['z'] = [], [], []
     total_step = (len(traj) //chunk_size)+1
     mapping = {'x' : 0, 'y' : 1, 'z' : 2}
-    traj = torch.tensor(traj)
+    traj = torch.tensor(traj, dtype=torch.float32).clone().detach().requires_grad_(False)
     pipeline = ChronosPipeline.from_pretrained(
             "amazon/chronos-t5-small",
             device_map="cuda",
@@ -782,10 +783,21 @@ def get_chronos_embeddings(traj, chunk_size=2000, concat=False):
             
             if len(context) == 0:
                 continue
-
-            embeddings, _ = pipeline.embed(context)
-            embeddings_[coord].append(embeddings)
+            
+            with torch.no_grad():
+                embeddings, _ = pipeline.embed(context)
+                embeddings = embeddings.cpu()
+                embeddings_[coord].append(embeddings)
+                del embeddings
+                torch.cuda.empty_cache()
+                gc.collect()
         embeddings_[coord] = torch.cat(embeddings_[coord], 0)
+        
     if concat:
         embeddings_ = torch.cat([embeddings_['x'], embeddings_['y'], embeddings_['z']], -1)
+    
+    del pipeline
+    del ChronosPipeline
+    torch.cuda.empty_cache()
+    gc.collect()
     return embeddings_
