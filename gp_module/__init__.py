@@ -16,125 +16,221 @@ from gp_module.utils import *
 import csv
 import os
 
-class Motion_GP():
+class MotionGP():
     def __init__(self, args):
+
         self.args = args
-        self.bbox = {}
-        self.device = args.device
-        
+        self.bbox_stats = {} 
         self.transls_gp = eval(self.args.gp.transls_model)
         self.rots_gp = eval(self.args.gp.rots_model)
+        
+        self.is_trained = False  # True = gp_model is optimized at least once
+        self.canonical_frame_idx = 'inf'
+        self.data_cano = None
 
-    def get_dataset(self, transls, rots,  canonical_idx=0, confidence=None, valid_can_thre=None, delta_cano=False):
-        self.canonical_idx = canonical_idx
-        if valid_can_thre is not None and confidence is not None:
-            valid_cano_mask = confidence[:,canonical_idx, 0]>valid_can_thre
+    def get_gp_gs_inference_input(self, transls_all, tgt_gs):
+        """
+        input
+        - transls_all: N,T,3
+        - tgt_gs: [times] # T_tgt
+        """
+        if tgt_gs is not None:
+            tgt_t_len = len(tgt_gs) # target time number
+        else:
+            tgt_t_len = self.bbox_stats['time'].size(1)
+        G = len(transls_all) # gaussian number
+
+        # transls
+        can_transls = transls_all[:, self.canonical_frame_idx, :].unsqueeze(1)
+        normed_can_transls = self.normalize_to_bbox(can_transls, prefix='transls')
+        normed_can_transls = normed_can_transls.repeat(1, tgt_t_len, 1)
+        
+        # time
+        if tgt_gs is not None: 
+            normed_time = self.bbox_stats['time'][:, list(tgt_gs), :] # 1, T, 1
+        else:
+            normed_time = self.bbox_stats['time'] # 1, T, 1
+
+        normed_time = normed_time.repeat(G,1,1)
+        gs_input = torch.cat((normed_can_transls, normed_time), -1) 
+        gs_input = gs_input.reshape(G*tgt_t_len, -1)
+        return gs_input
+
+
+    def get_training_dataset(self, transls, rots, confidence_weights):
+        # TODO: is_trained=True / False
+        print(f"first step?: {not self.is_trained} - bbox is updated!")
+        device = transls.device
+
+        if not self.is_trained:
+            print(f"first step!! bbox is updated!")
+            assert self.canonical_frame_idx == 'inf'
+            if self.args.gp.canonical_type == 'first_frame':
+                self.canonical_frame_idx = 0
+            elif self.args.gp.canonical_type == 'largest_confidence':
+                high_conf_mask = confidence_weights > 0.5
+                self.canonical_frame_idx = (high_conf_mask).sum(0).argmax().item()
+            print("canonical idx: ", self.canonical_frame_idx)
+            self.delta_cano = self.args.gp.delta_cano
+
+        if self.args.gp.valid_can_thre > 0:
+            breakpoint()
+            # TODO: update during training
+            valid_cano_mask = confidence_weights[:,self.canonical_frame_idx, 0]>valid_can_thre
             transls = transls[valid_cano_mask]
             rots = rots[valid_cano_mask]
-            if confidence is not None:
-                confidence = confidence[valid_cano_mask]
+            if confidence_weights is not None:
+                confidence_weights = confidence_weights[valid_cano_mask]
 
-        self.set_bbox(transls, 'transls')
-        transls = self.bbox_normalize(transls, 'transls')
-        self.set_bbox(rots, 'rots')
-        rots = self.bbox_normalize(rots, 'rots')
+        if not self.is_trained: 
+            self.set_bbox_stats(transls, 'transls')
+            self.set_bbox_stats(rots, 'rots')
+            print(self.bbox_stats)
 
-        self.transls_cano = transls[:, canonical_idx, :].unsqueeze(1)
-        self.rots_cano = rots[:, canonical_idx, :].unsqueeze(1)
-        self.delta_cano = delta_cano
+        transls = self.normalize_to_bbox(transls, 'transls')
+        rots = self.normalize_to_bbox(rots, 'rots')
+
+        self.transls_cano = transls[:, self.canonical_frame_idx, :].unsqueeze(1)
+        self.rots_cano = rots[:, self.canonical_frame_idx, :].unsqueeze(1)
 
         num_data_points = transls.shape[0]
         total_time = transls.shape[1] # Time
         # X0, Y0, Z0 
-        can_xyz = transls[:,canonical_idx]
+        can_xyz = transls[:,self.canonical_frame_idx]
         can_xyz = can_xyz.unsqueeze(1).repeat(1, total_time, 1)
         # target time
-        tgt_time = torch.linspace(-1, 1, total_time)
-        tgt_time = tgt_time.view(1, total_time, 1).repeat(num_data_points, 1, 1)
+        if not self.is_trained:
+            tgt_time = torch.linspace(-1, 1, total_time).to(device).view(1, total_time, 1)
+            self.bbox_stats['time'] = copy.deepcopy(tgt_time)
+        else:
+            tgt_time = self.bbox_stats['time']
+        tgt_time = tgt_time.repeat(num_data_points, 1, 1)
         # C0 => rsampling
-        can_confidence = confidence[:, canonical_idx]
-        can_confidence = can_confidence.unsqueeze(1).repeat(1, total_time, 1)
+        canonical_confidence_weights = confidence_weights[:, self.canonical_frame_idx]
+        canonical_confidence_weights = canonical_confidence_weights.unsqueeze(1).repeat(1, total_time, 1)
         
-        train_x = torch.cat((can_xyz, tgt_time, can_confidence), dim=-1)
+        input_features = torch.cat((can_xyz, tgt_time, canonical_confidence_weights), dim=-1)
 
-        if delta_cano:
-            train_y = torch.cat((transls-self.transls_cano, rots-self.rots_cano, confidence), -1)
+        if self.delta_cano:
+            target_values = torch.cat((transls-self.transls_cano, rots-self.rots_cano, confidence_weights), -1)
         else:
-            train_y = torch.cat((transls, rots, confidence), -1)
+            target_values = torch.cat((transls, rots, confidence_weights), -1)
 
-        if len(train_x) > 100:
-            self.viz_train_x = train_x[::10, :,:][:10]
-            self.viz_train_y = train_y[::10, :,:][:10]
+        if len(input_features) > 100:
+            self.viz_input_features = input_features[::10, :,:][:10]
+            self.viz_target_values = target_values[::10, :,:][:10]
         else:
-            self.viz_train_x = train_x[:10, :,:]
-            self.viz_train_y = train_y[:10, :,:]
+            self.viz_input_features = input_features[:10, :,:]
+            self.viz_target_values = target_values[:10, :,:]
 
-        train_x = train_x.reshape(num_data_points*total_time, -1)
-        train_y = train_y.reshape(num_data_points*total_time, -1)
+        input_features = input_features.reshape(num_data_points*total_time, -1)
+        target_values = target_values.reshape(num_data_points*total_time, -1)
+        self.full_input_features = copy.deepcopy(input_features)
 
-        confidence_mask = train_y[:,-1] > self.args.gp.confidence_thred
+        confidence_mask = target_values[:,-1] > self.args.gp.confidence_thred
 
-        train_x = train_x[confidence_mask]
-        train_y = train_y[confidence_mask]
-
-        return train_x, train_y
+        input_features = input_features[confidence_mask]
+        target_values = target_values[confidence_mask]
         
-    def init_gp(self, train_x, train_y, others=None):
-        try:
-            self.remove_gp()
-        except:
-            print("GP is not removed") 
+        return input_features, target_values
         
-        train_y_transls = train_y[...,:3]
-        train_y_rots = train_y[...,3:]
+    def initialize_gp_models(self, input_features=None, target_values=None, others=None):
+
+        target_values_transls = target_values[...,:3]
+        target_values_rots = target_values[...,3:]
 
         # likelihood        
         self.transls_likelihood = self.transls_gp.get_likelihood(self.args, "transls")
         self.rots_likelihood = self.transls_gp.get_likelihood(self.args, "rots")
 
         # gp_model       
-        self.transls_gp_model = self.transls_gp.init_from_data(self.args, 'transls', train_x, train_y_transls, self.transls_likelihood, others=others)
-        self.rots_gp_model = self.rots_gp.init_from_data(self.args, 'rots', train_x, train_y_rots, self.rots_likelihood, others=others)
+        self.transls_gp_model = self.transls_gp.init_from_data(self.args, 'transls', input_features, target_values_transls, self.transls_likelihood, others=others)
+        self.rots_gp_model = self.rots_gp.init_from_data(self.args, 'rots', input_features, target_values_rots, self.rots_likelihood, others=others)
 
         # mll (loss)
-        self.transls_mll = self.transls_gp.get_mll(self.transls_likelihood, self.transls_gp_model, train_x)
-        self.rots_mll = self.rots_gp.get_mll(self.rots_likelihood, self.rots_gp_model, train_x)
+        self.transls_mll = self.transls_gp.get_mll(self.transls_likelihood, self.transls_gp_model, input_features)
+        self.rots_mll = self.rots_gp.get_mll(self.rots_likelihood, self.rots_gp_model, input_features)
 
         # optimizer
         self.transls_optimizer = self.transls_gp.get_optimizer(self.args, 'transls', self.transls_likelihood, self.transls_gp_model)
-        self.rots_optimizer = self.rots_gp.get_optimizer(self.args, 'rots', self.rots_likelihood, self.rots_gp_model)   
+        self.rots_optimizer = self.rots_gp.get_optimizer(self.args, 'rots', self.rots_likelihood, self.rots_gp_model)
 
-    def set_bbox(self, data, prefix):
+    def initialize_gp_models_from_state_dict(self, state_dict=None):
+        self.is_trained = state_dict['is_trained']
+        self.canonical_frame_idx = state_dict['canonical_frame_idx']
+        self.bbox_stats = state_dict['bbox_stats']
+        self.delta_cano = state_dict['delta_cano']
+
+        # likelihood        
+        self.transls_likelihood = self.transls_gp.get_likelihood(self.args, "transls")
+        self.rots_likelihood = self.transls_gp.get_likelihood(self.args, "rots")
+        self.transls_likelihood.load_state_dict(state_dict['transls_likelihood'])
+        self.rots_likelihood.load_state_dict(state_dict['rots_likelihood'])
+
+        # model
+        inducing_key = [i for i in state_dict['transls_model'].keys() if i.endswith('inducing_points')][0]
+        transls_inducing_points = state_dict['transls_model'][inducing_key]
+        rots_inducing_points = state_dict['rots_model'][inducing_key]
+
+        self.transls_gp_model = self.transls_gp.init_from_data(self.args, 'transls', train_x=None, train_y=None, 
+                                                            likelihood=self.transls_likelihood, others=None,
+                                                            inducing_points = transls_inducing_points)
+
+        self.rots_gp_model = self.rots_gp.init_from_data(self.args, 'rots', train_x=None, train_y=None, 
+                                                            likelihood=self.rots_likelihood, others=None,
+                                                            inducing_points = rots_inducing_points)
+
+        self.transls_gp_model.load_state_dict(state_dict['transls_model'])
+        self.rots_gp_model.load_state_dict(state_dict['rots_model'])
+        
+        # optimizer
+        self.transls_optimizer = self.transls_gp.get_optimizer(self.args, 'transls', self.transls_likelihood, self.transls_gp_model)
+        self.rots_optimizer = self.rots_gp.get_optimizer(self.args, 'rots', self.rots_likelihood, self.rots_gp_model)   
+        self.transls_optimizer.load_state_dict(state_dict['transls_optimizer'])
+        self.rots_optimizer.load_state_dict(state_dict['rots_optimizer'])
+
+        # should be update the number of data of MLL (loss)
+        self.transls_mll = None
+        self.rots_mll = None
+
+    def reset_mll_data_num(self, new_input_features):
+        self.transls_mll = self.transls_gp.get_mll(self.transls_likelihood, self.transls_gp_model, new_input_features)
+        self.rots_mll = self.rots_gp.get_mll(self.rots_likelihood, self.rots_gp_model, new_input_features)
+
+    def set_bbox_stats(self, data, prefix):
         min_vals = data.min(dim=0, keepdim=True).values.min(dim=1, keepdim=True).values.squeeze(0)
         max_vals = data.max(dim=0, keepdim=True).values.max(dim=1, keepdim=True).values.squeeze(0)
 
         min_for_scaling = torch.floor(min_vals)
         max_for_scaling = torch.ceil(max_vals)
 
-        self.bbox.update({f'{prefix}_min': min_for_scaling, f'{prefix}_max': max_for_scaling})
+        self.bbox_stats.update({f'{prefix}_min': min_for_scaling, f'{prefix}_max': max_for_scaling})
     
-    def bbox_normalize(self, data, prefix):
-        min_for_scaling = self.bbox[f'{prefix}_min']
-        max_for_scaling = self.bbox[f'{prefix}_max']
+    def normalize_to_bbox(self, data, prefix):
+        assert data.dim() == 3 
+        min_for_scaling = self.bbox_stats[f'{prefix}_min']
+        max_for_scaling = self.bbox_stats[f'{prefix}_max']
 
         denominator = (max_for_scaling - min_for_scaling).unsqueeze(0)
         min_for_scaling_expanded = min_for_scaling.unsqueeze(0)
-
         data_scaled = 2 * (data - min_for_scaling_expanded) / denominator - 1
         return data_scaled
 
-    def bbox_denormalize(self, normalized_data, prefix):
-        
-        min_for_scaling = self.bbox[f'{prefix}_min']
-        max_for_scaling = self.bbox[f'{prefix}_max']
+    def denormalize_from_bbox(self, normalized_data, prefix):
+        min_for_scaling = self.bbox_stats[f'{prefix}_min']
+        max_for_scaling = self.bbox_stats[f'{prefix}_max']
 
-        denominator = (max_for_scaling - min_for_scaling).unsqueeze(0)
-        min_for_scaling_expanded = min_for_scaling.unsqueeze(0)
+        if normalized_data.dim() == 3:
+            denominator = (max_for_scaling - min_for_scaling).unsqueeze(0)
+            min_for_scaling_expanded = min_for_scaling.unsqueeze(0)
 
+        elif normalized_data.dim() == 2: 
+            denominator = (max_for_scaling - min_for_scaling)
+            min_for_scaling_expanded = min_for_scaling
         data = ((normalized_data + 1) /2.0)*denominator + min_for_scaling_expanded
         return data
 
-    def remove_gp(self):
+    def cleanup_gp_models(self):
         try:
             del self.transls_gp_model
             del self.rots_gp_model
@@ -145,11 +241,11 @@ class Motion_GP():
         except:
             pass
     
-    def set_device(self):
-        self.transls_gp_model.to(self.device)
-        self.transls_likelihood.to(self.device)
-        self.rots_gp_model.to(self.device)
-        self.rots_likelihood.to(self.device) 
+    def set_device(self, device):
+        self.transls_gp_model.to(device)
+        self.transls_likelihood.to(device)
+        self.rots_gp_model.to(device)
+        self.rots_likelihood.to(device) 
 
     def set_mode(self, type_):
         if type_ == 'train':
@@ -164,39 +260,46 @@ class Motion_GP():
             self.rots_gp_model.eval()
             self.rots_likelihood.eval()       
 
-    def fitting_gp(self, train_x, train_y, skip_rots=False):
+    def training_gp_models(self, input_features, target_values, skip_rots=False, prefix='', plot_graph=False):
+        if self.is_trained:
+            print("GP training is started for GP-GS medium step")
+        else:
+            print("GP training is started for the first step")
+            
         if self.args.gp.transls_model in ['ExactGPModel']: 
-            self.fitting_exact_gp(train_x, train_y, skip_rots=skip_rots) # full
+            self.train_exact_gp(input_features, target_values, skip_rots=skip_rots, plot_graph=plot_graph) # full
         elif self.args.gp.transls_model in ['MultitaskVariationalGPModel', 'IndependentVariationalGPModel']:
-            self.fitting_variational_gp(train_x, train_y, skip_rots=skip_rots)
+            self.train_variational_gp(input_features, target_values, skip_rots=skip_rots, plot_graph=plot_graph)
         else:
             raise NotImplementedError("Check training loop selection")
-
-    def fitting_exact_gp(self, train_x, train_y):
+        self.is_trained = True
+        print("GP training is finished")
+        
+    def train_exact_gp(self, input_features, target_values):
         breakpoint()
         self.set_device()
         self.set_mode('train')
 
-        train_x = train_x.to(self.device)
-        train_y = train_y.to(self.device)
+#        input_features = input_features.to(self.device)
+#        target_values = target_values.to(self.device)
 
-        y_transls = train_y[:, :3]
-        y_rots = train_y[:, 3:-1] 
-        y_confidence = train_y[:, -1:]
+        target_transls = target_values[:, :3]
+        target_rots = target_values[:, 3:-1] 
+        target_confidence = target_values[:, -1:]
 
-        for i in range(self.args.gp.epochs):
+        for i in range(self.args.gp.inner_epochs):
             # reset gradient
             self.transls_optimizer.zero_grad()
             self.rots_optimizer.zero_grad()
             with gpytorch.settings.use_toeplitz(False), gpytorch.settings.max_root_decomposition_size(30):
                 # forward
-                print("train_x:", train_x.shape)
-                transls_output = self.transls_gp_model(train_x)
-                transls_loss = -1 * self.transls_mll(transls_output, y_transls)
+                print("input_features:", input_features.shape)
+                transls_predicted = self.transls_gp_model(input_features)
+                transls_loss = -1 * self.transls_mll(transls_predicted, target_transls)
                 #, batch_confidence) 
 
-                rots_output = self.rots_gp_model(train_x)
-                rots_loss = -1 * seflf.rots_mll(rots_output, y_rots)
+                rots_predicted = self.rots_gp_model(input_features)
+                rots_loss = -1 * self.rots_mll(rots_predicted, target_rots)
                 #, batch_confidence)
 
                 loss = transls_loss + rots_loss
@@ -209,54 +312,64 @@ class Motion_GP():
             if (i + 1) % 1 == 0:
                 print(f"[{i+1}] Loss: {loss.item():.4f}")
 
-    def fitting_variational_gp(self, train_x, train_y, skip_rots=False):
-        
-        self.gp_opt_stat = {} 
-        train_x_confidence = train_x[..., -1:]
-        train_x = train_x[..., :-1]
+    def train_variational_gp(self, input_features, target_values, skip_rots=False, plot_graph=False):
+        self.optimization_stats = {} 
 
-        train_y_confidence = train_y[..., -1:]
-        train_y = train_y[..., :-1]
+        input_confidence = input_features[..., -1:]
+        input_features = input_features[..., :-1]
 
-        self.set_device()
+        target_confidence = target_values[..., -1:]
+        target_values = target_values[..., :-1]
+
+        device = input_features.device
+        self.set_device(device)
         self.set_mode('train')
 
-        train_x = train_x.to(self.device)
-        train_y = train_y.to(self.device)
+#        input_features = input_features.to(self.device)
+#        target_values = target_values.to(self.device)
 
         # define dataloader
-        train_dataset = TensorDataset(train_x, train_y, train_x_confidence, train_y_confidence)
-        train_loader = DataLoader(train_dataset, batch_size=self.args.gp.batch_size, shuffle=True) 
+        training_dataset = TensorDataset(input_features, target_values, input_confidence, target_confidence)
+        training_loader = DataLoader(training_dataset, batch_size=self.args.gp.inner_batch_size, shuffle=True)
         
         # TODO: check stability
         #gpytorch.settings.cholesky_jitter(1e-3)
         #gpytorch.settings.max_cholesky_size(2000)
 
-        for i in range(self.args.gp.epochs):
-            for batch_idx, (batch_x, batch_y, batch_x_conf, batch_y_conf) in enumerate(train_loader):
-                # input x
-                batch_x = batch_x.to(self.device)
-                batch_x_before = batch_x
-                if self.args.gp.x_rsample != 'none':
-                    batch_x_stdv = estimate_std(batch_x, batch_x_conf.to(self.device), i, args=self.args.gp) 
-                    batch_x = torch.distributions.Normal(batch_x, batch_x_stdv).rsample()
+        iteration_count = 0
+        for epoch in range(self.args.gp.inner_epochs):
+            if self.is_trained and iteration_count > self.args.gp.inner_iteration: 
+                break
+            for batch_idx, (batch_inputs, batch_targets, batch_input_conf, batch_target_conf) in enumerate(training_loader):
+                # for GP-GS step 
+                if self.is_trained: # TODO
+                    print(f"this is not the first round: {iteration_count}")
+                    if iteration_count > self.args.gp.inner_iteration:
+                        break 
+                batch_inputs = batch_inputs
+                original_inputs = batch_inputs  # batch_x_before → original_inputs
+        
+                if self.args.gp.input_rsample != 'none':
+                    input_stddev = estimate_std(batch_inputs, batch_input_conf, epoch, args=self.args.gp)
+                    batch_inputs = torch.distributions.Normal(batch_inputs, input_stddev).rsample()
+                
                 # gt y
-                batch_y_transls = batch_y[..., :3].to(self.device)
-                batch_y_rots = batch_y[..., 3:].to(self.device)
-                batch_y_confidence = batch_y_conf.to(self.device)
+                batch_target_transls = batch_targets[..., :3]
+                batch_target_rots = batch_targets[..., 3:]
+                batch_target_confidence = batch_target_conf
 
                 # reset gradient
                 self.transls_optimizer.zero_grad()
                 self.rots_optimizer.zero_grad()
 
-                transls_output = self.transls_gp_model(batch_x)
-                transls_loss = -1 * self.transls_mll(transls_output, batch_y_transls)
-                #, batch_confidence) 
+                transls_predicted = self.transls_gp_model(batch_inputs)
+                transls_loss = -1 * self.transls_mll(transls_predicted, batch_target_transls)
+                #, batch_target_confidence) 
                 # TODO: confidence aware MLL
 
-                rots_output = self.rots_gp_model(batch_x)
-                rots_loss = -1 * self.rots_mll(rots_output, batch_y_rots)
-                #, batch_confidence)
+                rots_predicted = self.rots_gp_model(batch_inputs)
+                rots_loss = -1 * self.rots_mll(rots_predicted, batch_target_rots)
+                #, batch_target_confidence)
 
                 if skip_rots:
                     loss = transls_loss
@@ -270,14 +383,17 @@ class Motion_GP():
 
                 self.transls_optimizer.step()
                 self.rots_optimizer.step()
+            
+                iteration_count += 1
+            if epoch % 1 == 0:
+                print(f"[{epoch+1}] Loss: {loss.item():.4f}")
 
-            if (i) % 1 == 0:
-                print(f"[{i+1}] Loss: {loss.item():.4f}")
-
-        self.gp_opt_stat['loss'] = loss.item()
-        self.gp_opt_stat['transls_xy_lengthscale'] = self.transls_gp_model.covar_module.get_average_lengthscale('xy')
-        self.gp_opt_stat['transls_zt_lengthscale'] = self.transls_gp_model.covar_module.get_average_lengthscale('zt')
-        self.plot_traj(self.viz_train_x, self.viz_train_y, name=self.args.exp_name, step=i, gp_opt_stat=self.gp_opt_stat)
+        self.optimization_stats['loss'] = loss.item()
+        self.optimization_stats['transls_xy_lengthscale'] = self.transls_gp_model.covar_module.get_average_lengthscale('xy')
+        self.optimization_stats['transls_zt_lengthscale'] = self.transls_gp_model.covar_module.get_average_lengthscale('zt')
+        
+        if plot_graph:
+            self.plot_traj(self.viz_input_features, self.viz_target_values, name=self.args.exp_name, step=epoch, optimization_stats=self.optimization_stats)
 
     def sampling(self, data, chunk_size=None, denorm=False):
         x = data
@@ -302,27 +418,71 @@ class Motion_GP():
                 transls_output += self.transls_cano
                 rots_output += self.rots_cano
 
-            transls_output = self.bbox_denormalize(transls_output, 'transls')
-            rots_output = self.bbox_denormalize(rots_output, 'rots')
+            transls_output = self.denormalize_from_bbox(transls_output, 'transls')
+            rots_output = self.denormalize_from_bbox(rots_output, 'rots')
         return transls_output, rots_output
+    
+    def get_guidance(self, data, gaussian_num=None, chunk_size=None, denorm=False, skip_rots=False):
+        transls_output_mean, rots_output_mean = [], []
+        transls_output_var, rots_output_var = [], []
+
+        with torch.no_grad():
+            if chunk_size is not None and chunk_size > 0:
+                total_step = (len(data) //chunk_size)+1
+
+                for step in range(total_step):
+                    try:
+                        x = data[step*chunk_size:(step+1)*chunk_size]
+                    except:
+                        x = data[step*chunk_size:]
+                    transls_output_mean.append(self.transls_gp_model(x).mean)
+                    transls_output_var.append(self.transls_gp_model(x).variance)
+                    if not skip_rots:
+                        rots_output_mean.append(self.rots_gp_model(x).mean)
+                        rots_output_var.append(self.rots_gp_model(x).variance)
+
+                transls_output_mean = torch.cat(transls_output_mean, 0)
+                transls_output_var = torch.cat(transls_output_var, 0)
+                if not skip_rots:
+                    rots_output_mean = torch.cat(rots_output_mean, 0)
+                    rots_output_var = torch.cat(rots_output_var, 0)
+            else:
+                transls_output_mean = self.transls_gp_model(data).mean
+                transls_output_var = self.transls_gp_model(data).var
+                if not skip_rots:
+                    rots_output_mean = self.rots_gp_model(data).mean
+                    rots_output_var = self.rots_gp_model(data).var
+
+            if denorm:
+                if self.delta_cano:
+                    transls_output_mean += self.transls_cano
+                    if not skip_rots:
+                        rots_output_mean += self.rots_cano
+                transls_output_mean = self.denormalize_from_bbox(transls_output_mean, 'transls')
+                if not skip_rots:
+                    rots_output_mean = self.denormalize_from_bbox(rots_output_mean, 'rots')
+        if gaussian_num is not None:
+            transls_output_mean = transls_output_mean.reshape(gaussian_num, -1, 3)
+            transls_output_var = transls_output_var.reshape(gaussian_num, -1, 3)
+        return transls_output_mean, transls_output_var, rots_output_mean, rots_output_var
 
     def recon_loss(self, transls_curr, rots_curr, confidence):
         pass
 
     # utils
-    def plot_traj(self, train_x, train_y, name=None, step=None, gp_opt_stat=None): 
+    def plot_traj(self, input_features, target_values, name=None, step=None, optimization_stats=None): 
         self.set_mode('eval')
-        loss = gp_opt_stat['loss']
+        loss = optimization_stats['loss']
         
-        train_x = train_x.to(self.device)
-        T = train_x.size(1)
-        N = train_x.size(0)
+#        input_features = input_features.to(self.device)
+        T = input_features.size(1)
+        N = input_features.size(0)
 
-        train_x = train_x[..., :-1]
-        train_x = train_x.reshape(N*T, -1)
-        transls_output, rots_output = self.sampling(train_x, chunk_size=5000)
+        input_features = input_features[..., :-1]
+        input_features = input_features.reshape(N*T, -1)
+        transls_output, rots_output = self.sampling(input_features, chunk_size=5000)
         pred_transls = transls_output.reshape(-1,T,3).detach().cpu()
-        tgt_transls = train_y[:,:,:3]
+        tgt_transls = target_values[:,:,:3]
 
         
         # visualization
@@ -356,6 +516,7 @@ class Motion_GP():
         if name is None:
             name = 'tensor_visualization'
         plt.savefig(f'{name}.png', dpi=300, bbox_inches='tight')
+        breakpoint()
         print(f"save image in {name}")
         plt.close()
         self.set_mode('train')
@@ -364,8 +525,8 @@ class Motion_GP():
         save_dict = {"data": self.args.init_data,
                     "data_num": self.args.data_num,
                     } 
-        gp_opt_stat = copy.deepcopy(self.gp_opt_stat)
-        save_dict.update(gp_opt_stat)
+        optimization_stats = copy.deepcopy(self.optimization_stats)
+        save_dict.update(optimization_stats)
         update_dict = self.args.gp.__dict__
         save_dict.update(update_dict)
         
@@ -402,3 +563,24 @@ class Motion_GP():
                 with open(filename, 'a', newline='') as csvfile:
                     writer = csv.DictWriter(csvfile, fieldnames=existing_header)
                     writer.writerow(save_dict)
+
+    def get_state_dict(self):
+        # transls: gp_model, optimizer, schedular
+        # rots: gp_model, optimizer, schedular
+        # is_ready: is this optimized at least once? 
+        ckpt_dicts = {}
+        ckpt_dicts['bbox_stats'] = self.bbox_stats
+        ckpt_dicts['is_trained'] = self.is_trained
+        ckpt_dicts['delta_cano'] = self.delta_cano
+        ckpt_dicts['canonical_frame_idx'] = self.canonical_frame_idx
+
+        ckpt_dicts['transls_model'] = self.transls_gp_model.state_dict()
+        ckpt_dicts['rots_model'] = self.rots_gp_model.state_dict()
+
+        ckpt_dicts['transls_likelihood'] = self.transls_likelihood.state_dict()
+        ckpt_dicts['rots_likelihood'] = self.rots_likelihood.state_dict()
+
+        ckpt_dicts['transls_optimizer'] = self.transls_optimizer.state_dict()
+        ckpt_dicts['rots_optimizer'] = self.rots_optimizer.state_dict()
+
+        return ckpt_dicts

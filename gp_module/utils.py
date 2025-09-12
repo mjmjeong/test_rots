@@ -52,7 +52,7 @@ def vis_tracks_3d(
 # Rsample 
 ###############################################################
 def estimate_std(x, x_conf, iteration, args):
-    type_ = args.x_rsample
+    type_ = args.input_rsample
     if type_ == 'lookup':
         pass
 
