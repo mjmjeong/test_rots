@@ -25,6 +25,12 @@ from flow3d.vis.utils import get_server
 from flow3d.vis.viewer import DynamicViewer
 from flow3d.normal_utils import depth_to_normal
 
+from gp_module import MotionGP
+from gp_module.loss import gp_gs_loss
+import gc
+import copy
+from flow3d.scene_model import Hook
+
 class Trainer:
     def __init__(
         self,
@@ -42,6 +48,7 @@ class Trainer:
         validate_every: int = 500,
         validate_video_every: int = 1000,
         validate_viewer_assets_every: int = 100,
+        motion_gp: MotionGP | None = None,
     ):
         self.device = device
         self.log_every = log_every
@@ -57,6 +64,7 @@ class Trainer:
         self.lr_cfg = lr_cfg
         self.losses_cfg = losses_cfg
         self.optim_cfg = optim_cfg
+        self.cfg = cfg # total
 
         self.reset_opacity_every = (
             self.optim_cfg.reset_opacity_every_n_controls * self.optim_cfg.control_every
@@ -100,6 +108,8 @@ class Trainer:
         self.fg_ssim_metric = mSSIM()
         self.bg_lpips_metric = mLPIPS()
         self.fg_lpips_metric = mLPIPS()
+    
+        self.motion_gp = motion_gp
 
     def set_epoch(self, epoch: int):
         self.epoch = epoch
@@ -115,6 +125,8 @@ class Trainer:
             "global_step": self.global_step,
             "epoch": self.epoch,
         }
+        if self.motion_gp:
+            ckpt['gp_model'] = self.motion_gp.get_state_dict()
         torch.save(ckpt, path)
         guru.info(f"Saved checkpoint at {self.global_step=} to {path}")
 
@@ -127,9 +139,22 @@ class Trainer:
         state_dict = ckpt["model"]
         model = SceneModel.init_from_state_dict(state_dict, kwargs['cfg'])
         model = model.to(device)
+
+        # GP
+        motion_gp = MotionGP(kwargs['cfg']) 
+        gp_state_dict = None
+        # load gp_state
+        #if 'gp_model' in ckpt.keys(): # TODO: initialization check
+        #    gp_state_dict = ckpt["gp_model"]
+        #if kwargs.gp_hard_path is not None:
+        #    gp_state_dict = torch.load(kwargs.gp_hard_path)
+        if gp_state_dict is not None:
+            motion_gp.initialize_gp_models_from_state_dict(gp_state_dict)
+
         print(use_2dgs)
         model.use_2dgs = use_2dgs
-        trainer = Trainer(model, device, *args, **kwargs)
+        trainer = Trainer(model, device, *args, **kwargs, motion_gp=motion_gp) 
+        
         del kwargs['cfg']
         
         if "optimizers" in ckpt:
@@ -178,6 +203,16 @@ class Trainer:
                 time.sleep(0.1)
             self.viewer.lock.acquire()
 
+        if not self.cfg.gp.gp_gs_inference_per_batch:           
+            if self.motion_gp.is_trained and self.cfg.gp.w_gp_recon > 0:
+                if getattr(self, 'gp_transls_mean', None) is None:
+                    self.gp_gs_inference_full()
+                elif self.gp_transls_mean.size(0) != self.model.fg.get_coefs().size(0): # mismatched # TODO; naive
+                    # TODO: densification
+                    breakpoint() # TODO: modifying densification code
+                    # after when densified
+                    self.gp_gs_inference_full()
+
         loss, stats, num_rays_per_step, num_rays_per_sec = self.compute_losses(batch)
         if loss.isnan():
             guru.info(f"Loss is NaN at step {self.global_step}!!")
@@ -210,6 +245,219 @@ class Trainer:
 
         return loss.item()
 
+    def gp_train_step(self, train_loader):
+        # Confidence optimization:
+        #confidence_optimizers, confidence_scheduler = self.configure_optimizers()
+        transls, rots = self.model.compute_transforms_all_sequence()
+        transls, rots = transls.detach(), rots.detach()
+
+        self.model.compute_poses_fg()
+
+        from matplotlib.pyplot import get_cmap
+        cmap = get_cmap("gist_rainbow")
+        server = get_server(port=8890)
+        vis_label = np.linspace(0, 1, 10)
+        colors = cmap(np.asarray(vis_label))[:, :3]
+        
+        server.scene.add_point_cloud(
+            f"/test",
+            np.asarray(transls[:100, 0, :].detach().cpu()),
+            #colors=colors[0 : 0 + 1],
+            point_size=0.05,
+            point_shape="circle",
+        )
+        server.scene.add_point_cloud(f"/test",np.asarray(transls[:30000, 0, :].detach().cpu()), colors=colors[0],point_size=0.05,point_shape="circle",)
+        
+        
+        breakpoint()
+        # TODO: hook
+        if self.cfg.gp.use_confidence:
+            response = []
+            for batch in train_loader:
+                if True:
+                    breakpoint()
+                
+                    B = batch["imgs"].shape[0]
+                    W, H = img_wh = batch["imgs"].shape[2:0:-1]
+        
+                    ts = batch["ts"]
+                    w2cs = batch["w2cs"]
+                    Ks = batch["Ks"]
+                    imgs = batch["imgs"]    # (B, H, W).
+                    
+                    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+                    i = 0
+                    rendered_all = []        
+                    bg_color = torch.ones(1, 3, device=device)
+
+                    backward_hook_colors = Hook(self.model.fg.color_identity)
+                    rendered = self.model.render_conf(
+                        ts[i].item(),
+                        w2cs[None, i].cuda(),
+                        Ks[None, i].cuda(),
+                        img_wh,
+                        bg_color=bg_color.cuda(),
+                        return_depth=False,
+                        return_mask=False,
+                    )
+
+                    breakpoint()
+                    rendered_img = rendered['img'] # 1, H,W,3
+                    rendered_img.backward(gradient=torch.ones_like(rendered_img))
+                    print(self.model.fg.params.colors.grad)
+                    
+                    gradient = backward_hook_colors.grad_in
+                    breakpoint()
+                    def sigmoid_gradient(param, param_grad, eps=1e-8):
+                        sigmoid_val = torch.sigmoid(param)
+                        sigmoid_derivative = sigmoid_val * (1 - sigmoid_val)
+                        
+                        # Handle near-zero derivatives
+                        safe_derivative = torch.where(
+                            sigmoid_derivative < eps,
+                            torch.ones_like(sigmoid_derivative) * eps,  # Replace with epsilon
+                            sigmoid_derivative
+                        )
+                        modified_gradient = param_grad / safe_derivative
+                        return modified_gradient
+                    
+                    # TODO: hook (tomorrow)
+                    response = sigmoid_gradient(self.model.fg.params.colors, self.model.fg.params.colors.grad)
+                    breakpoint()
+                    import torchvision
+                    torchvision.utils.save_image(rendered_img.permute(0,3,1,2), 'test.png')
+
+                    self.model.zero_grad()
+                    print(self.model.fg.params.colors.grad)
+                    for opt in self.optimizers.values():
+    #                    opt.step()
+                        opt.zero_grad(set_to_none=True)
+                    for sched in self.scheduler.values():
+                        sched.step()
+                if True:
+                    B = batch["imgs"].shape[0]
+                    W, H = img_wh = batch["imgs"].shape[2:0:-1]
+        
+                    ts = batch["ts"]
+                    w2cs = batch["w2cs"]
+                    Ks = batch["Ks"]
+                    imgs = batch["imgs"]    # (B, H, W).
+                    
+                    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+                    i = 0
+                    rendered_all = []        
+                    bg_color = torch.ones(1, 3, device=device)
+
+                    backward_hook_colors = Hook(self.model.fg.color_identity)
+                    rendered = self.model.render_conf(
+                        ts[i].item(),
+                        w2cs[None, i].cuda(),
+                        Ks[None, i].cuda(),
+                        img_wh,
+                        bg_color=bg_color.cuda(),
+                        return_depth=False,
+                        return_mask=self.model.has_bg,
+                    )
+
+                    rendered_img = rendered['img'] # 1, H,W,3
+                    rendered_img.backward(gradient=2*torch.ones_like(rendered_img))
+                    print(self.model.fg.params.colors.grad)
+                    gradient = backward_hook_colors.grad_in
+
+                    def sigmoid_gradient(param, param_grad, eps=1e-8):
+                        sigmoid_val = torch.sigmoid(param)
+                        sigmoid_derivative = sigmoid_val * (1 - sigmoid_val)
+                        
+                        # Handle near-zero derivatives
+                        safe_derivative = torch.where(
+                            sigmoid_derivative < eps,
+                            torch.ones_like(sigmoid_derivative) * eps,  # Replace with epsilon
+                            sigmoid_derivative
+                        )
+                        modified_gradient = param_grad / safe_derivative
+                        return modified_gradient
+                    
+                    # TODO: hook (tomorrow)
+                    response = sigmoid_gradient(self.model.fg.params.colors, self.model.fg.params.colors.grad)
+                    breakpoint()
+                    import torchvision
+                    torchvision.utils.save_image(rendered_img.permute(0,3,1,2), 'test.png')
+
+                    self.model.zero_grad()
+                    print(self.model.fg.params.colors.grad)
+                
+    #                for opt in self.optimizers.values():
+    #                    opt.step()
+    #                    opt.zero_grad(set_to_none=True)
+    #                for sched in self.scheduler.values():
+    #                    sched.step()
+    
+
+            breakpoint()
+            total_response = torch.stack(response, 0)
+            def viz_confidence():
+                pass
+            
+            viz_confidence()
+            breakpoint()
+        else:
+            confidence_weights = torch.ones_like(transls[:,:,0]).unsqueeze(-1)
+
+        # keep GS model to cpu
+        self.model = self.model.to("cpu")
+        torch.cuda.empty_cache()
+        gc.collect()
+
+        with torch.no_grad():
+            input_features, target_values = self.motion_gp.get_training_dataset(transls, rots, confidence_weights)
+
+        if not self.motion_gp.is_trained: # initialize model
+            others={}
+            data_scaled = self.motion_gp.normalize_to_bbox(transls, prefix='transls')
+            if self.motion_gp.delta_cano:
+                data_scaled = data - self.motion_gp.transls_cano
+            others['conf'] = confidence_weights
+            others['traj'] = data_scaled
+            # put full traj in others
+            # TODO: check motion is normalized
+            self.motion_gp.initialize_gp_models(input_features, target_values, others=others)
+
+        # Optimization / Training / TODO: check cuda optimization
+        self.motion_gp.reset_mll_data_num(input_features) # TODO: check 
+        torch.cuda.empty_cache()
+        gc.collect()
+        # motion_gp -> CUDA, training
+        self.motion_gp.is_trained = True # TODO: just for debug
+        self.motion_gp.training_gp_models(
+            input_features, 
+            target_values,
+            skip_rots=self.cfg.gp.transls_only,
+            plot_graph=False)
+
+        # back model to gpu
+#        self.motion_gp.set_device(torch.device('cpu'))
+        torch.cuda.empty_cache()
+        gc.collect()
+        self.model = self.model.to(self.device)
+
+    def gp_gs_inference_full(self):
+        print("GP-GS inference full")
+        with torch.no_grad():
+            transls_all, rots_all = self.model.compute_transforms_all_sequence()
+            st = time.time()
+            gp_inputs = self.motion_gp.get_gp_gs_inference_input(transls_all.detach(), tgt_gs=None) 
+            gp_transls_mean, gp_transls_var, gp_rots_mean, gp_rots_var = self.motion_gp.get_guidance(gp_inputs,
+                                gaussian_num=transls_all.size(0),
+                                denorm=self.cfg.gp.recon_in_gs_scale,
+                                chunk_size=self.cfg.gp.gp_gs_chunk_size,
+                                skip_rots=self.cfg.gp.transls_only)
+            self.gp_transls_mean = copy.deepcopy(gp_transls_mean)
+            self.gp_transls_var = copy.deepcopy(gp_transls_var)
+            self.gp_rots_mean = copy.deepcopy(gp_rots_mean)
+            self.gp_rots_var = copy.deepcopy(gp_rots_var)                               
+        torch.cuda.empty_cache()
+        gc.collect()
+            
     def compute_losses(self, batch):
         self.model.training = True
 
@@ -484,6 +732,39 @@ class Trainer:
             )
             loss += small_accel_loss_tracks * self.losses_cfg.w_smooth_tracks
 
+        # GP loss 
+        gp_recon_loss = torch.tensor(0.0)
+        if self.motion_gp.is_trained and self.cfg.gp.w_gp_recon > 0:
+            transls_all, rots_all = self.model.compute_transforms_all_sequence()
+            
+            if self.cfg.gp.inference_tgt_time == 'batch_ts':
+                tgt_gs = ts
+            elif self.cfg.gp.inference_tgt_time == 'batch_ts_target_ts':
+                tgt_gs = torch.unique(torch.cat((ts, target_ts_vec),0))
+
+            if self.cfg.gp.gp_gs_inference_per_batch:
+                st = time.time()
+                with torch.no_grad():
+                    gp_inputs = self.motion_gp.get_gp_gs_inference_input(transls_all.detach(), tgt_gs=tgt_gs) 
+                    tgt_gp_transls_mean, tgt_gp_transls_var, tgt_gp_rots_mean, tgt_gp_rots_var = self.motion_gp.get_guidance(gp_inputs,
+                                gaussian_num=transls_all.size(0),
+                                denorm=self.cfg.gp.recon_in_gs_scale,
+                                chunk_size=self.cfg.gp.gp_gs_chunk_size,
+                                skip_rots=self.cfg.gp.transls_only)
+                print("gp inference per batch", time.time()-st)
+            else:
+                tgt_gp_transls_mean = self.gp_transls_mean[:, list(tgt_gs.detach().cpu())]
+                tgt_gp_transls_var = self.gp_transls_var[:, list(tgt_gs.detach().cpu())]
+            
+            pred_transls_3d = transls_all[:, list(tgt_gs.detach().cpu())]
+            if not self.cfg.gp.recon_in_gs_scale:
+                pred_transls_3d = self.motion_gp.normalize_to_bbox(pred_transls_3d, prefix='transls')            
+            gp_recon_loss = gp_gs_loss(self.cfg.gp, pred_transls_3d, tgt_gp_transls_mean.detach(), tgt_gp_transls_var.detach())
+
+            if not self.cfg.gp.transls_only:
+                breakpoint() # gp for rotation too
+                rots_transls_3d = rots_all[:, list(tgt_gs.detach().cpu())]
+            loss += gp_recon_loss * self.cfg.gp.w_gp_recon
 
         # Constrain the std of scales.
         # TODO: do we want to penalize before or after exp?
@@ -520,6 +801,7 @@ class Trainer:
             "train/track_2d_loss": track_2d_loss.item(),
             "train/small_accel_loss": small_accel_loss.item(),
             "train/z_acc_loss": z_accel_loss.item(),
+            "train/gp_loss": gp_recon_loss.item(),
             "train/num_gaussians": self.model.num_gaussians,
             "train/num_fg_gaussians": self.model.num_fg_gaussians,
             "train/num_bg_gaussians": self.model.num_bg_gaussians,

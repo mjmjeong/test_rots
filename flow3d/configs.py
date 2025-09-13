@@ -77,7 +77,6 @@ class LossesConfig:
     w_bing_intensity: float = 0.0
     w_bing_smooth: float = 0.0
 
-
 @dataclass
 class OptimizerConfig:
     max_steps: int = 5000
@@ -123,14 +122,42 @@ class MotionConfig:
 
 @dataclass
 class GPConfig:
+    use_gp: bool=True
+    use_confidence: bool= True # TODO 
+    w_gp_recon: float = 0.1
+    canonical_type: str = 'first_frame'
+    #########################################
+    # Input / Output
+    #########################################
+    input_feature_type: str = 'global_xyz'
+    output_feature_type: str = 'global_xyz' # global_xyz_diff #motion
+    transls_only: bool = True
+    input_rsample: str = 'none'
+    rsample_std: float = 0.1
+    #########################################
+    # Optimization
+    ##########################################
+    gp_start_epoch: int= -1
+    gp_update_every: int = 1 #TODO: this is for debug
+    gp_stop_epoch: int = 100000 # considering adaptive control / densification
+    inner_epochs: int = 3 # TODO # for the first frame
+    inner_iteration: int = 4 # TODO
+    inner_batch_size: int = 5000
+    transls_gp_lr: float = 0.005
+    rots_gp_lr: float = 0.01
+    #########################################
+    # Uncertainty calculation: filtering data
+    #########################################
+    sigmoid_scale: float = 1.0 
+    sigmoid_bias: float = 1.0     
+    confidence_thred: float = 0.0
+    valid_can_thre: float = -1.0
+    #########################################
+    # base model
+    ############################################
     transls_model: str = 'IndependentVariationalGPModel'
     rots_model: str = 'IndependentVariationalGPModel'
-    #########################################
-    # input x (uncertain input)
-    #########################################
-    delta_cano: bool = False
-    x_rsample: str = 'none'
-    rsample_std: float = 0.1
+    same_inducing: bool = False
     #########################################
     # inducing points
     #########################################
@@ -140,18 +167,19 @@ class GPConfig:
     inducing_max: float = 1    
     nx: int = 6
     nt: int = 200
-    inducing_method: str = 'vel_chronos_kmeans' # 'RX-grid'
+#    inducing_method: str = 'vel_chronos_kmeans' # 'RX-grid'
+    inducing_method: str = 'vel_kmeans' # 'RX-grid' #TODO
     inducing_task_specific: bool = False
     #########################################
     # Kernel
     #########################################
     # hexplane
-    combine_type: str = 'prod'
-    transls_lengthscale_xy: float = 0.001
+    combine_type: str = 'add'
+    transls_lengthscale_xy: float = 0.0005
     transls_lengthscale_zt: float = 0.001
     rots_lengthscale_xy: float = 0.001
     rots_lengthscale_zt: float = 0.001
-    nu_matern_xy: float = 1.5
+    nu_matern_xy: float = 0.5
     nu_matern_zt: float = 1.5
     # interpolation kernel
     #use_grid_kernel: bool = False
@@ -162,11 +190,12 @@ class GPConfig:
     # nn strategy
     #knn: int = 32
     #use_multitask: bool = True
-    #########################################
-    # Optimization
-    #########################################
-    epochs: int = 10
-    batch_size: int = 20000
-    transls_gp_lr: float = 0.01
-    rots_gp_lr: float = 0.01
-    confidence_thred: float = 0.0
+    ################################################
+    # GP-GS
+    ################################################
+    inference_tgt_time: str = 'batch_ts' # batch_ts, batch_ts_target_ts
+    recon_in_gs_scale: bool = True
+    gp_gs_chunk_size: int = 200000
+    gp_gs_inference_per_batch: bool = False
+    gp_gs_loss_type: str = 'mse'
+    variance_scaling: float = 1.0

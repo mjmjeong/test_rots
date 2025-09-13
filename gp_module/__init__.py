@@ -29,11 +29,17 @@ class MotionGP():
         self.data_cano = None
 
     def get_gp_gs_inference_input(self, transls_all, tgt_gs):
+        # TODO
         """
         input
         - transls_all: N,T,3
         - tgt_gs: [times] # T_tgt
         """
+        #if self.input_feature_type == 'global_xyz':
+        #    input_feature_xyz = cano_mean.unsqueeze(1).repeat(1, total_time, 1)
+        #else self.input_feature_type == 'canonical_idx_diff': 
+        #    breakpoint()
+        breakpoint()
         if tgt_gs is not None:
             tgt_t_len = len(tgt_gs) # target time number
         else:
@@ -57,7 +63,7 @@ class MotionGP():
         return gs_input
 
 
-    def get_training_dataset(self, transls, rots, confidence_weights):
+    def get_training_dataset(self, cano_mean, cano_quat, means, quats, transls, rots, confidence_weights):
         # TODO: is_trained=True / False
         print(f"first step?: {not self.is_trained} - bbox is updated!")
         device = transls.device
@@ -77,44 +83,78 @@ class MotionGP():
             breakpoint()
             # TODO: update during training
             valid_cano_mask = confidence_weights[:,self.canonical_frame_idx, 0]>valid_can_thre
+            cano_mean = cano_mean[valid_cano_mask]
+            cano_quat = cano_quat[valid_cano_mask]
+            means = transls[valid_cano_mask]
+            quats = rots[valid_cano_mask]
             transls = transls[valid_cano_mask]
             rots = rots[valid_cano_mask]
+            
             if confidence_weights is not None:
                 confidence_weights = confidence_weights[valid_cano_mask]
 
         if not self.is_trained: 
+            self.set_bbox_stats(cano_mean, 'cano_mean')
+            self.set_bbox_stats(cano_quat, 'cano_quat')
+            self.set_bbox_stats(means, 'means')
+            self.set_bbox_stats(quats, 'quats')
             self.set_bbox_stats(transls, 'transls')
             self.set_bbox_stats(rots, 'rots')
+
             print(self.bbox_stats)
 
         transls = self.normalize_to_bbox(transls, 'transls')
-        rots = self.normalize_to_bbox(rots, 'rots')
-
-        self.transls_cano = transls[:, self.canonical_frame_idx, :].unsqueeze(1)
-        self.rots_cano = rots[:, self.canonical_frame_idx, :].unsqueeze(1)
+        rots = self.normalize_to_bbox(rots, 'rots')        
+        means = self.normalize_to_bbox(means, 'means')
+        quats = self.normalize_to_bbox(quats, 'quats')
+        cano_mean = self.normalize_to_bbox(cano_mean, 'cano_mean')
+        cano_quat = self.normalize_to_bbox(cano_quat, 'cano_quat')
 
         num_data_points = transls.shape[0]
         total_time = transls.shape[1] # Time
-        # X0, Y0, Z0 
-        can_xyz = transls[:,self.canonical_frame_idx]
-        can_xyz = can_xyz.unsqueeze(1).repeat(1, total_time, 1)
-        # target time
+        ##########################################################
+        # Input
+        ###########################################################
+        # input_feature 1: X0, Y0, Z0 
+        if self.input_feature_type == 'global_xyz':
+            input_feature_xyz = cano_mean.unsqueeze(1).repeat(1, total_time, 1)
+#            self.transls_cano = transls[:, self.canonical_frame_idx, :].unsqueeze(1)
+#            self.rots_cano = rots[:, self.canonical_frame_idx, :].unsqueeze(1)
+#            input_feature_xyz = transls[:,self.canonical_frame_idx]
+#            input_feature_xyz = input_feature_xyz.unsqueeze(1).repeat(1, total_time, 1)
+        
+        # input_feature 2: target time
         if not self.is_trained:
             tgt_time = torch.linspace(-1, 1, total_time).to(device).view(1, total_time, 1)
             self.bbox_stats['time'] = copy.deepcopy(tgt_time)
         else:
             tgt_time = self.bbox_stats['time']
         tgt_time = tgt_time.repeat(num_data_points, 1, 1)
+
         # C0 => rsampling
-        canonical_confidence_weights = confidence_weights[:, self.canonical_frame_idx]
-        canonical_confidence_weights = canonical_confidence_weights.unsqueeze(1).repeat(1, total_time, 1)
-        
+        if self.input_feature_type == 'global_xyz':
+            canonical_confidence_weights = torch.ones_like(tgt_time)
+        #elif self.input_feature_type == 'canonical_idx_diff':         
+        #    canonical_confidence_weights = confidence_weights[:, self.canonical_frame_idx]
+        #    canonical_confidence_weights = canonical_confidence_weights.unsqueeze(1).repeat(1, total_time, 1)
+
+        breakpoint()
         input_features = torch.cat((can_xyz, tgt_time, canonical_confidence_weights), dim=-1)
 
-        if self.delta_cano:
-            target_values = torch.cat((transls-self.transls_cano, rots-self.rots_cano, confidence_weights), -1)
-        else:
+        ##########################################################
+        # output
+        ###########################################################
+        
+        if self.output_feature_type == 'global_xyz':
+            target_values = torch.cat((means, quats, confidence_weights), -1)
+        elif self.output_feature_type == 'motion':
             target_values = torch.cat((transls, rots, confidence_weights), -1)
+        elif self.output_feature_type == 'diff_xyz':
+            target_values = torch.cat((means - cano_mean, quats - cano_quat, confidence_weights), -1)
+
+        #if self.delta_cano:
+        #    target_values = torch.cat((transls-self.transls_cano, rots-self.rots_cano, confidence_weights), -1)
+        #else:
 
         if len(input_features) > 100:
             self.viz_input_features = input_features[::10, :,:][:10]
@@ -412,7 +452,8 @@ class MotionGP():
         else:
             transls_output = self.transls_gp_model(x).mean
             rots_output = self.rots_gp_model(x).mean
-
+        
+        breakpoint() # regarding type
         if denorm:
             if self.delta_cano:
                 transls_output += self.transls_cano
@@ -453,7 +494,9 @@ class MotionGP():
                     rots_output_mean = self.rots_gp_model(data).mean
                     rots_output_var = self.rots_gp_model(data).var
 
+            breakpoint() # following output type
             if denorm:
+                breakpoint()
                 if self.delta_cano:
                     transls_output_mean += self.transls_cano
                     if not skip_rots:
@@ -461,13 +504,12 @@ class MotionGP():
                 transls_output_mean = self.denormalize_from_bbox(transls_output_mean, 'transls')
                 if not skip_rots:
                     rots_output_mean = self.denormalize_from_bbox(rots_output_mean, 'rots')
-        if gaussian_num is not None:
+
+        breakpoint()
+        if gaussian_num is not None: 
             transls_output_mean = transls_output_mean.reshape(gaussian_num, -1, 3)
             transls_output_var = transls_output_var.reshape(gaussian_num, -1, 3)
         return transls_output_mean, transls_output_var, rots_output_mean, rots_output_var
-
-    def recon_loss(self, transls_curr, rots_curr, confidence):
-        pass
 
     # utils
     def plot_traj(self, input_features, target_values, name=None, step=None, optimization_stats=None): 
@@ -484,7 +526,6 @@ class MotionGP():
         pred_transls = transls_output.reshape(-1,T,3).detach().cpu()
         tgt_transls = target_values[:,:,:3]
 
-        
         # visualization
         grid_x = np.linspace(0,1,T)
         fig, axes = plt.subplots(3, 2, figsize=(12, 10))

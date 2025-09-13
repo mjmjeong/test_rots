@@ -128,7 +128,7 @@ def main(cfg: TrainConfig):
                 setattr(cfg.gp, param, wandb.config[wandb_key])
                 guru.info(f"Updated cfg.gp.{param} = {wandb.config[wandb_key]}")
         
-        # Handle the special boolean flag parameter 
+        # Handle the special boolean flag parameter
         if 'gp.inducing_task_specific' in wandb.config:
             # WandB will provide True/False, we set it directly to the config
             cfg.gp.inducing_task_specific = wandb.config['gp.inducing_task_specific']
@@ -147,60 +147,40 @@ def main(cfg: TrainConfig):
     guru.info(f"Final config after WandB updates:\n{asdict(cfg)}")
     # import data    
     root_dir = 'observation/tmp_asset/'
-    type_ = 'opt'
+    gp_data_path = 'gp_data'
+    step = 25000
     debugging_set = -1
+    breakpoint()
+    cano_mean = torch.load(os.path.join(gp_data_path, f'step{step}_cano_mean.pt'))
+    cano_quat = torch.load(os.path.join(gp_data_path, f'step{step}_cano_quat.pt'))
 
-    if type_ == 'init': 
-        transls = torch.load(f"{root_dir}/init_3dtraj/xyz.pt", weights_only=False).cpu()
-        rots_basis = torch.load(f"{root_dir}rots_init.pt", weights_only=False)
-        coef = torch.load(f"{root_dir}coef_init.pt", weights_only=False)
-        rots = torch.einsum("gb,btm->gtm", coef, rots_basis)
-        confidence = 1.0*torch.load(f"{root_dir}/init_3dtraj/visible.pt").cpu().unsqueeze(-1)
-  
-    elif type_ == 'opt':
-        transls_basis = torch.load(f"{root_dir}transls_opt.pt", weights_only=False)
-        rots_basis = torch.load(f"{root_dir}rots_opt.pt", weights_only=False)
-        coef = torch.load(f"{root_dir}coef_opt.pt", weights_only=False)
+    transls = torch.load(os.path.join(gp_data_path, f'step{step}_transls.pt'))
+    rots = torch.load(os.path.join(gp_data_path, f'step{step}_rots.pt'))
 
-        transls = torch.einsum("gb,btm->gtm", coef, transls_basis)
-        rots = torch.einsum("gb,btm->gtm", coef, rots_basis)
-        confidence = torch.randn_like(transls[:,:,0]).unsqueeze(-1)
-        confidence = torch.ones_like(confidence)
-    
-    elif type_ == 'opt_artificial':
-        transls_basis = torch.load(f"{root_dir}transls_opt.pt", weights_only=False)
-        rots_basis = torch.load(f"{root_dir}rots_opt.pt", weights_only=False)
-        coef = torch.load(f"{root_dir}coef_opt.pt", weights_only=False)
-
-        transls = torch.einsum("gb,btm->gtm", coef, transls_basis)
-        rots = torch.einsum("gb,btm->gtm", coef, rots_basis)
-        confidence = torch.randn_like(transls[:,:,0]).unsqueeze(-1)
-
-        N = transls.size(0)
-        T = transls.size(1)
-        transls = transls[0].unsqueeze(0).repeat(N,1,1)
-        rots = rots[0].unsqueeze(0).repeat(N,1,1)
-
-        noise_transls = torch.randn_like(rots[:,0,0]).reshape(N,1,1).repeat(1,T,3) * 3
-        noise_rots = torch.randn_like(rots[:,0,0]).reshape(N,1,1).repeat(1,T,6) * 3
-
-        transls += noise_transls
-        rots += noise_rots
-
+    means = torch.load(os.path.join(gp_data_path, f'step{step}_means.pt'))
+    quats = torch.load(os.path.join(gp_data_path, f'step{step}_quats.pt'))
+    breakpoint()
     if debugging_set > 0:
+        cano_mean = cano_mean[:debugging_set]
+        cano_quat = cano_quat[:debugging_set]
+        
+        means = means[:debugging_set]
+        quats = quats[:debugging_set]
+        
         transls = transls[:debugging_set]
         rots = rots[:debugging_set]
         confidence = confidence[:debugging_set]
         
-    cfg.init_data = type_
-    cfg.data_num = debugging_set
+#    cfg.data_num = debugging_set
+    
     # init model
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     cfg.device = device
 
     motion_gp = MotionGP(cfg)    
-    train_x, train_y = motion_gp.get_training_dataset(transls, rots, confidence_weights=confidence)
+    train_x, train_y, others = motion_gp.get_training_dataset(cano_mean, cano_rot, means, quats, transls, rots, confidence_weights=confidence)
+    breakpoint()
     # run
     os.makedirs(cfg.exp_name, exist_ok=True)
     
@@ -210,16 +190,12 @@ def main(cfg: TrainConfig):
 #        print(f"Cholesky jitter (float32): {jitter_setting.value(torch.float32)}")
 
     if not motion_gp.is_trained:
-        # Full Traj (even with messy)
-        others={}
-        data_scaled = motion_gp.normalize_to_bbox(transls, prefix='transls')
-        if motion_gp.delta_cano:
-            data_scaled = data - motion_gp.transls_cano
-        others['conf'] = confidence
-        others['traj'] = data_scaled
+        # initialization for chronos
+        train_y_full = others['target_y_origin']
+        # TODO: norm, denorm
         motion_gp.initialize_gp_models(train_x, train_y, others=others)
     
-#    motion_gp.is_trained = True
+#    motion_gp.is_trained = True # Debug
     motion_gp.training_gp_models(train_x, train_y, skip_rots=True, plot_graph=True)
     motion_gp.save_csv("search_results.csv")
     dict_ = motion_gp.get_state_dict()
@@ -232,7 +208,36 @@ def main(cfg: TrainConfig):
                 'val/lengthscale_xy':motion_gp.optimization_stats['transls_xy_lengthscale'],
                 'val/lengthscale_zt':motion_gp.optimization_stats['transls_zt_lengthscale'],
                 })
-    wandb.fini1sh()
+    wandb.finish()
+
+def create_sweep_config():
+    """Create the WandB sweep configuration"""
+    sweep_config = {
+        'method': 'bayes',  # or 'grid', 'random'
+        'metric': {
+            'name': 'val/loss',  # Make sure this metric is logged in your training loop
+            'goal': 'minimize'
+        },
+        'program': 'debug_gp.py',
+        'parameters': {
+            # Fixed values for non-GP parameters
+            'batch_size': {'value': 8},
+            'project': {'value': 'Flow3D_GP_Sweeps'},
+            'gp.epochs': {'value': 100},
+            'gp.batch_size': {'values': [5000]},
+            'gp.inducing_method': {'values': ['vel_chronos_kmeans']},
+            'gp.transls_gp_lr': {'values': [0.1, 0.01, 0.001, 0.005, 0.0001]},
+            'gp.combine_type': {'values': ['prod', 'add']},
+            'gp.transls_lengthscale_xy': {'values': [0.002, 0.001, 0.0005, 0.0002, 0.0001, 0.00001]},
+            'gp.transls_lengthscale_zt': {'values': [0.002, 0.001, 0.0005, 0.0002, 0.0001, 0.00001]},
+            'gp.nu_matern_xy': {'values': [0.5, 1.5]},
+            'gp.nu_matern_zt': {'values': [0.5, 1.5]},
+            'gp.nx': {'values': [6]},
+            'gp.nt': {'values': [200]},
+        }
+    }
+
+    return sweep_config
 
 
 def create_sweep_config():
@@ -247,7 +252,7 @@ def create_sweep_config():
         'parameters': {
             # Fixed values for non-GP parameters
             'batch_size': {'value': 8},
-            'project': {'value': 'gp-step2-debug'},
+            'project': {'value': 'full_init_search'},
             'gp.epochs': {'value': 3},
             'gp.batch_size': {'values': [5000]},
             'gp.inducing_method': {'values': ['vel_chronos_kmeans']},
@@ -256,8 +261,8 @@ def create_sweep_config():
             'gp.transls_lengthscale_zt': {'values': [0.002, 0.001, 0.0005]},
             'gp.nu_matern_xy': {'values': [0.5, 1.5]},
             'gp.nu_matern_zt': {'values': [0.5, 1.5]},
-            'gp.nx': {'values': [6, 3]},
-            'gp.nt': {'values': [200, 100, 50]},
+            'gp.nx': {'values': [6]},
+            'gp.nt': {'values': [200]},
         }
     }
     return sweep_config

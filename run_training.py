@@ -138,6 +138,15 @@ def main(cfg: TrainConfig):
         collate_fn=BaseDataset.train_collate_fn,
     )
 
+    confidence_train_loader = DataLoader(
+        train_dataset,
+        batch_size=1,
+        num_workers=cfg.num_dl_workers,
+        persistent_workers=True,
+        collate_fn=BaseDataset.train_collate_fn,
+    )
+    breakpoint()
+
     validator = None
     if (
         train_video_view is not None
@@ -168,11 +177,16 @@ def main(cfg: TrainConfig):
         )
     ):
         trainer.set_epoch(epoch)
+
+        # TODO: change order (debug)
+        if epoch > cfg.gp.gp_start_epoch and epoch % cfg.gp.gp_update_every == 0 and epoch < cfg.gp.gp_stop_epoch:            
+            trainer.gp_train_step(confidence_train_loader) # batch=1
+
         for batch in train_loader:
             batch = to_device(batch, device)
             loss = trainer.train_step(batch)
             pbar.set_description(f"Loss: {loss:.6f}")
-
+                
         if validator is not None:
             if (epoch > 0 and epoch % cfg.validate_every == 0) or (
                 epoch == cfg.num_epochs - 1
@@ -198,6 +212,7 @@ def initialize_and_checkpoint_model(
         guru.info(f"model checkpoint exists at {ckpt_path}")
         return
 
+    # TODO: basis: initailized with gp
     fg_params, motion_bases, bg_params, tracks_3d = init_model_from_tracks(
         train_dataset,
         cfg.num_fg,
@@ -227,9 +242,16 @@ def initialize_and_checkpoint_model(
         cfg.use_2dgs,
     )
 
+    
     guru.info(f"Saving initialization to {ckpt_path}")
     os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
-    torch.save({"model": model.state_dict(), "epoch": 0, "global_step": 0}, ckpt_path)
+    save_dict = {"model": model.state_dict(), "epoch": 0, "global_step": 0} 
+
+    breakpoint()
+    if cfg.gp.basis_initialize_with_gp:
+        save_dict['gp_model'] = motion_gp.get_state_dict()
+        
+    torch.save(save_dict, ckpt_path)
 
 
 def init_model_from_tracks(

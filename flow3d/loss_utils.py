@@ -225,3 +225,127 @@ def reparameterize_vonmise_fisher(vmf_kappa, axis):
     # sampling visualization
     pass
 
+def bingham_loglikelihood(vec10, quat, normalization=False):
+    """
+    Compute the log-likelihood of the Bingham distribution for quaternions using element-wise operations.
+    
+    Parameters:
+    - vec10: torch.Tensor of shape (N, 10) containing the Bingham parameters
+            format: [a, b, c, d, e, f, g, h, i, j] which represent elements of the 4x4 symmetric matrix A
+    - quat: torch.Tensor of shape (N, 4) containing quaternions
+    
+    Returns:
+    - log_likelihood: torch.Tensor of shape (N,) containing the log-likelihood for each quaternion
+    """
+    N = quat.shape[0]
+    
+    # Normalize the quaternions
+    quat_norm = torch.nn.functional.normalize(quat, p=2, dim=1)
+    
+    # Extract quaternion components
+    q0 = quat_norm[:, 0]
+    q1 = quat_norm[:, 1]
+    q2 = quat_norm[:, 2]
+    q3 = quat_norm[:, 3]
+    
+    # Extract Bingham matrix parameters
+    a = vec10[:, 0]  # A[0,0]
+    b = vec10[:, 1]  # A[1,1]
+    c = vec10[:, 2]  # A[2,2]
+    d = vec10[:, 3]  # A[3,3]
+    e = vec10[:, 4]  # A[0,1] = A[1,0]
+    f = vec10[:, 5]  # A[0,2] = A[2,0]
+    g = vec10[:, 6]  # A[0,3] = A[3,0]
+    h = vec10[:, 7]  # A[1,2] = A[2,1]
+    i = vec10[:, 8]  # A[1,3] = A[3,1]
+    j = vec10[:, 9]  # A[2,3] = A[3,2]
+    
+    # Compute the diagonal terms
+    diag_terms = a * q0 * q0 + b * q1 * q1 + c * q2 * q2 + d * q3 * q3
+    
+    # Compute the off-diagonal terms (each appears twice in the quadratic form)
+    off_diag_terms = 2 * (e * q0 * q1 + 
+                        f * q0 * q2 + 
+                        g * q0 * q3 + 
+                        h * q1 * q2 + 
+                        i * q1 * q3 + 
+                        j * q2 * q3)
+    
+    # Compute the quadratic form q^T·A·q
+    quadratic_form = diag_terms + off_diag_terms
+    
+    # Compute log normalization constant
+    # This is a simplified approach and may need to be adjusted based on specific requirements
+    if normalization:
+        log_likelihood =  -1 * (quadratic_form - log_F)
+    else:
+        log_likelihood =  -1 * quadratic_form
+    
+    return log_likelihood
+
+def bingham_loglikelihood_matmul(vec10, quat, normalization=False):
+    """
+    Compute the log-likelihood of the Bingham distribution using matrix multiplication.
+    This function is provided for verification purposes.
+    """
+    N = quat.shape[0]
+    
+    # Normalize the quaternions
+    quat_norm = torch.nn.functional.normalize(quat, p=2, dim=1)
+    
+    # Initialize batch of 4x4 symmetric matrices
+    A = torch.zeros(N, 4, 4, device=quat.device)
+    
+    # Fill in the diagonal elements
+    A[:, 0, 0] = vec10[:, 0]  # a
+    A[:, 1, 1] = vec10[:, 1]  # b
+    A[:, 2, 2] = vec10[:, 2]  # c
+    A[:, 3, 3] = vec10[:, 3]  # d
+    
+    # Fill in the off-diagonal elements
+    A[:, 0, 1] = A[:, 1, 0] = vec10[:, 4]  # e
+    A[:, 0, 2] = A[:, 2, 0] = vec10[:, 5]  # f
+    A[:, 0, 3] = A[:, 3, 0] = vec10[:, 6]  # g
+    A[:, 1, 2] = A[:, 2, 1] = vec10[:, 7]  # h
+    A[:, 1, 3] = A[:, 3, 1] = vec10[:, 8]  # i
+    A[:, 2, 3] = A[:, 3, 2] = vec10[:, 9]  # j
+    
+    # Reshape quat for batch matrix multiplication
+    q = quat_norm.unsqueeze(2)  # Shape: (N, 4, 1)
+    
+    # Compute q^T·A·q using batch matrix multiplication
+    # First compute A·q: (N, 4, 4) × (N, 4, 1) = (N, 4, 1)
+    Aq = torch.bmm(A, q)
+    
+    # Then compute q^T·(A·q): (N, 1, 4) × (N, 4, 1) = (N, 1, 1)
+    qAq = torch.bmm(q.transpose(1, 2), Aq)
+    
+    # Compute the quadratic form q^T·A·q
+    quadratic_form = qAq.squeeze()
+    
+    # Compute log normalization constant
+    log_F = torch.zeros(N, device=vec10.device)
+    
+    if normalization:
+        log_likelihood =  -1 * (quadratic_form - log_F)
+    else:
+        log_likelihood =  -1 * quadratic_form
+    
+    return log_likelihood
+
+
+def compute_bingham_geometry(vec10, return_entropy=False, return_concent=False):
+    # 10 vec -> mat
+    matrices = bingham_recon_mta(vec10)  # (N, 4, 4)
+    eigenvalues, eigenvectors = torch.linalg.eigh(matrices)
+    
+    concentration_neg_min, _ = -eigenvalues.min(-1) # Negative of smallest eigenvalue
+    concentration_sum_neg = -torch.sum(eigenvalues, dim=1)
+    
+    if return_entropy:
+        pass
+    concentration_var = torch.var(eigenvalues, dim=1)
+    # Return all concentration measures for analysis
+    return {
+        'eigenvectors': eigenvectors
+    }

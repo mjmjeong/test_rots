@@ -111,6 +111,7 @@ class GaussianParams(nn.Module):
         motion_coefs: torch.Tensor | None = None,
         scene_center: torch.Tensor | None = None,
         scene_scale: torch.Tensor | float = 1.0,
+        delta_quats: torch.Tensor | None = None,
     ):
         super().__init__()
         if not check_gaussian_sizes(
@@ -139,6 +140,9 @@ class GaussianParams(nn.Module):
             scene_center = torch.zeros(3, device=means.device)
         self.register_buffer("scene_center", scene_center)
         self.register_buffer("scene_scale", torch.as_tensor(scene_scale))
+        if delta_quats is not None:
+            params_dict["delta_quats"] = nn.Parameter(delta_quats)
+        self.color_identity = nn.Identity()
 
     @staticmethod
     def init_from_state_dict(state_dict, prefix="params."):
@@ -148,6 +152,7 @@ class GaussianParams(nn.Module):
             "motion_coefs": None,
             "scene_center": torch.zeros(3),
             "scene_scale": torch.tensor(1.0),
+            "delta_quats": None, # additional parameter
         }
         for k in req_keys + list(args.keys()):
             if f"{prefix}{k}" in state_dict:
@@ -161,6 +166,9 @@ class GaussianParams(nn.Module):
     def get_colors(self) -> torch.Tensor:
         return self.color_activation(self.params["colors"])
 
+    def get_colors_hook(self) -> torch.Tensor:
+        return F.sigmoid(self.params["colors"])
+
     def get_scales(self) -> torch.Tensor:
         return self.scale_activation(self.params["scales"])
 
@@ -169,6 +177,10 @@ class GaussianParams(nn.Module):
 
     def get_quats(self) -> torch.Tensor:
         return self.quat_activation(self.params["quats"])
+
+    def get_delta_quats(self) -> torch.Tensor:
+        assert "delta_quats" in self.params
+        return self.quat_activation(self.params["delta_quats"])
 
     def get_coefs(self) -> torch.Tensor:
         assert "motion_coefs" in self.params
@@ -239,6 +251,14 @@ class MotionBases(nn.Module):
     ###############################################################
     # aggregation method
     ###############################################################
+    def compute_transforms_all_sequence(self, coefs):
+        transls = self.params["transls"]  # (B, T, 3)
+        rots = self.params["rots"]  # (B, T, 6)
+        # coefs: GxB
+        transls = torch.einsum("pk,kni->pni", coefs, transls) # GxB, BxTx3 => GxTx3
+        rots = torch.einsum("pk,kni->pni", coefs, rots)  # (G, B, 6)        
+        return transls, rots
+
     def compute_transforms(self, ts: torch.Tensor, coefs: torch.Tensor, train=False) -> torch.Tensor:
         """
         :param ts (B)

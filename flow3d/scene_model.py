@@ -9,6 +9,21 @@ from torch import Tensor
 from flow3d.params import GaussianParams, MotionBases, CameraScales, CameraPoses
 from flow3d.custom_params import BayesianMotionBases
 
+class Hook:
+    def __init__(self, module, backward=True):
+        if backward:
+            self.hook = module.register_backward_hook(self.hook_fn)
+        else:
+            self.hook = module.register_forward_hook(self.hook_fn)
+        self.grad_in = None
+        self.grad_out = None
+
+    def hook_fn(self, module, grad_input, grad_output):
+        self.grad_in = grad_input
+        self.grad_out = grad_output
+    
+    def close(self):
+        self.hook.remove()
 
 class SceneModel(nn.Module):
     def __init__(
@@ -73,8 +88,16 @@ class SceneModel(nn.Module):
         coefs = self.fg.get_coefs()  # (G, K)
         if inds is not None:
             coefs = coefs[inds]
-        transfms, loss_dict = self.motion_bases.compute_transforms(ts, coefs, train=self.training)  # (G, B, 3, 4)
+        if "delta_quats" in self.fg.params:
+            transfms, loss_dict = self.motion_bases.compute_transforms(ts, coefs, self.fg.delta_quats, train=self.training)  # (G, B, 3, 4)
+        else:
+            transfms, loss_dict = self.motion_bases.compute_transforms(ts, coefs, train=self.training)  # (G, B, 3, 4)
         return transfms, loss_dict
+    
+    def compute_transforms_all_sequence(self):
+        coefs = self.fg.get_coefs()
+        transls, rots = self.motion_bases.compute_transforms_all_sequence(coefs=coefs)
+        return transls, rots
 
     def compute_poses_fg(
         self, ts: torch.Tensor | None, inds: torch.Tensor | None = None
@@ -124,6 +147,12 @@ class SceneModel(nn.Module):
 
     def get_colors_all(self) -> torch.Tensor:
         colors = self.fg.get_colors()
+        if self.bg is not None:
+            colors = torch.cat([colors, self.bg.get_colors()], dim=0).contiguous()
+        return colors
+    
+    def get_colors_all_hook(self) -> torch.Tensor:
+        colors = self.fg.color_identity(self.fg.get_colors_hook())
         if self.bg is not None:
             colors = torch.cat([colors, self.bg.get_colors()], dim=0).contiguous()
         return colors
@@ -344,6 +373,138 @@ class SceneModel(nn.Module):
             # We want to be able to access to xys' gradients later in a
             # torch.no_grad context.
             self._current_xys.retain_grad()
+
+        assert render_colors.shape[-1] == sum(ds_expected.values())
+        outputs = torch.split(render_colors, list(ds_expected.values()), dim=-1)
+        out_dict = {}
+        for i, (name, dim) in enumerate(ds_expected.items()):
+            x = outputs[i]
+            assert x.shape[-1] == dim, f"{x.shape[-1]=} != {dim=}"
+            if name == "tracks_3d":
+                x = x.reshape(C, H, W, B, 3)
+            out_dict[name] = x
+        out_dict["acc"] = alphas
+        out_dict["rend_normal"] = render_normals
+        out_dict["surf_normal"] = surf_normals
+        if loss_dict is not None:
+            out_dict["loss_dict"] = loss_dict
+        return out_dict
+
+    def render_conf(
+        self,
+        # A single time instance for view rendering.
+        t: int | None,
+        w2cs: torch.Tensor,  # (C, 4, 4)
+        Ks: torch.Tensor,  # (C, 3, 3)
+        img_wh: tuple[int, int],
+        # Multiple time instances for track rendering: (B,).
+        target_ts: torch.Tensor | None = None,  # (B)
+        target_w2cs: torch.Tensor | None = None,  # (B, 4, 4)
+        bg_color: torch.Tensor | float = 1.0,
+        colors_override: torch.Tensor | None = None,
+        means: torch.Tensor | None = None,
+        quats: torch.Tensor | None = None,
+        target_means: torch.Tensor | None = None,
+        return_color: bool = True,
+        return_depth: bool = False,
+        return_mask: bool = False,
+        fg_only: bool = False,
+        filter_mask: torch.Tensor | None = None,
+    ) -> dict:
+
+        curr_w2cs = w2cs
+
+        if target_w2cs is not None:
+            target_w2cs_clone = target_w2cs
+        device = w2cs.device
+        C = w2cs.shape[0]
+
+        W, H = img_wh
+        pose_fnc = self.compute_poses_fg if fg_only else self.compute_poses_all
+        N = self.num_fg_gaussians if fg_only else self.num_gaussians
+        loss_dict = None
+        if means is None or quats is None:
+            means, quats, loss_dict = pose_fnc(
+                torch.tensor([t], device=device) if t is not None else None
+            )
+            means = means[:, 0]
+            quats = quats[:, 0]
+
+        if colors_override is None:
+            if return_color:
+                colors_override = (
+                    self.fg.get_colors() if fg_only else self.get_colors_all_hook()
+                )
+            else:
+                colors_override = torch.zeros(N, 0, device=device)
+
+        D = colors_override.shape[-1]
+
+        scales = self.fg.get_scales() if fg_only else self.get_scales_all()
+        opacities = self.fg.get_opacities() if fg_only else self.get_opacities_all()
+
+        if isinstance(bg_color, float):
+            bg_color = torch.full((C, D), bg_color, device=device)
+        assert isinstance(bg_color, torch.Tensor)
+
+        mode = "RGB"
+        ds_expected = {"img": D}
+
+        B = 0
+
+        assert colors_override.shape[-1] == sum(ds_expected.values())
+        assert bg_color.shape[-1] == sum(ds_expected.values())
+
+        if return_depth:
+            mode = "RGB+ED"
+            ds_expected["depth"] = 1
+
+        if self.use_2dgs:
+            colors_override = torch.nan_to_num(colors_override, nan=1e-6)
+            backgrounds = torch.nan_to_num(bg_color, nan=1.0)
+
+            outputs = rasterization_2dgs(
+                means=means,
+                quats=quats,
+                scales=scales,
+                opacities=opacities,
+                colors=colors_override,
+                backgrounds=bg_color,
+                viewmats=curr_w2cs,  # [C, 4, 4]
+                Ks=Ks,  # [C, 3, 3]
+                width=W,
+                height=H,
+                packed=False,
+                render_mode=mode,
+            )
+
+            (
+                render_colors,
+                alphas,
+                render_normals,
+                surf_normals,
+                _,
+                _,
+                info,
+            ) = outputs
+        
+        else:
+            render_colors, alphas, info = rasterization(
+                means=means,
+                quats=quats,
+                scales=scales,
+                opacities=opacities,
+                colors=colors_override,
+                backgrounds=bg_color,
+                viewmats=curr_w2cs,  # [C, 4, 4]
+                Ks=Ks,  # [C, 3, 3]
+                width=W,
+                height=H,
+                packed=False,
+                render_mode=mode,
+            )
+            render_normals = None
+            surf_normals = None
 
         assert render_colors.shape[-1] == sum(ds_expected.values())
         outputs = torch.split(render_colors, list(ds_expected.values()), dim=-1)

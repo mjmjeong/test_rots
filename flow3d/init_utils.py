@@ -629,6 +629,38 @@ def vis_tracks_3d(
             point_shape="diamond",
         )
 
+def vis_confident_points(
+    server: ViserServer,
+    vis_points: np.ndarray | None = None,
+    name: str = "tracks",
+):
+    """
+    :param vis_tracks (np.ndarray): (N, T, 3)
+
+    """
+    colors = cmap(np.asarray(vis_label))[:, :3]
+    N, T = vis_tracks.shape[:2]
+    vis_tracks = np.asarray(vis_tracks)
+    vis_points = np.asarray(vis_points)
+    for i in range(N):
+        server.scene.add_spline_catmull_rom(
+            f"/{name}/{i}/spline", vis_tracks[i], color=colors[i], segments=T - 1
+        )
+        server.scene.add_point_cloud(
+            f"/{name}/{i}/start",
+            vis_tracks[i, [0]],
+            colors=colors[i : i + 1],
+            point_size=0.05,
+            point_shape="circle",
+        )
+        server.scene.add_point_cloud(
+            f"/{name}/{i}/end",
+            vis_tracks[i, [-1]],
+            colors=colors[i : i + 1],
+            point_size=0.05,
+            point_shape="diamond",
+        )
+
 
 def sample_initial_bases_centers(
     mode: str, cano_t: int, tracks_3d: TrackObservations, num_bases: int, cfg
